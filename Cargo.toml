@@ -1,0 +1,22 @@
+[package]
+name = "rexec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = ["menhera-cooldown"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rexec"
+path = "src/bin/rexec/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["term", "signal", "process", "fs", "user", "poll"] }
