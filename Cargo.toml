@@ -3,7 +3,12 @@ name = "rexec"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-publish = ["menhera-cooldown"]
+license = "Apache-2.0 OR MPL-2.0"
+repository = "https://github.com/metastable-void/rexec"
+readme = "README.md"
+description = "Command execution aggregator for AI agents: a per-user host that runs commands in fresh PTYs, serialises their output to a shared console, strips ANSI escapes for the calling agent, and journals every run to a JSONL transcript."
+keywords = ["ai-agents", "pty", "command-runner", "transcript", "ipc"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 path = "src/lib.rs"
