@@ -19,6 +19,9 @@ pub struct Spawned {
     pub master: OwnedFd,
     pub child: Pid,
     pub errno_pipe_read: OwnedFd,
+    /// Write end of a pipe attached to the child's stdin, when the caller
+    /// requested one. Write bytes here and drop to send EOF.
+    pub stdin_write: Option<OwnedFd>,
 }
 
 #[derive(Debug)]
@@ -48,7 +51,12 @@ impl fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-pub fn spawn(argv: &[String], envs: &[(String, String)], cwd: &str) -> Result<Spawned, SpawnError> {
+pub fn spawn(
+    argv: &[String],
+    envs: &[(String, String)],
+    cwd: &str,
+    with_stdin_pipe: bool,
+) -> Result<Spawned, SpawnError> {
     if argv.is_empty() {
         return Err(SpawnError::NulByte("argv"));
     }
@@ -76,6 +84,17 @@ pub fn spawn(argv: &[String], envs: &[(String, String)], cwd: &str) -> Result<Sp
 
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(SpawnError::Pipe)?;
 
+    // Optional stdin pipe: child reads from read end, parent writes to write end.
+    // O_CLOEXEC keeps the child from inheriting fds it shouldn't; dup2(read, 0)
+    // in the child gives fd 0 (which is not CLOEXEC) and the original cloexec fd
+    // is closed automatically at execvp.
+    let (stdin_read, stdin_write) = if with_stdin_pipe {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC).map_err(SpawnError::Pipe)?;
+        (Some(r), Some(w))
+    } else {
+        (None, None)
+    };
+
     let winsize = Winsize {
         ws_row: PTY_ROWS,
         ws_col: PTY_COLS,
@@ -85,23 +104,34 @@ pub fn spawn(argv: &[String], envs: &[(String, String)], cwd: &str) -> Result<Sp
     let termios = make_termios()?;
 
     // SAFETY: forkpty is called before this function spawns any threads in the parent. The child
-    // branch performs only async-signal-safe operations (chdir, setenv, write, _exit) plus
+    // branch performs only async-signal-safe operations (chdir, setenv, dup2, write, _exit) plus
     // execvp on prebuilt C strings, and _exits on any failure.
     let result = unsafe { forkpty(Some(&winsize), Some(&termios)) }.map_err(SpawnError::Fork)?;
 
     match result {
         ForkptyResult::Parent { child, master } => {
             drop(write_fd);
+            // Parent doesn't read from the stdin pipe.
+            drop(stdin_read);
             Ok(Spawned {
                 master,
                 child,
                 errno_pipe_read: read_fd,
+                stdin_write,
             })
         }
         ForkptyResult::Child => {
             let write_raw = write_fd.as_raw_fd();
+            let stdin_read_raw = stdin_read.as_ref().map(|fd| fd.as_raw_fd());
             // SAFETY: we are in the post-fork child.
             unsafe {
+                if let Some(fd) = stdin_read_raw
+                    && libc::dup2(fd, 0) < 0
+                {
+                    let errno = Errno::last() as i32;
+                    write_errno(write_raw, errno);
+                    libc::_exit(127);
+                }
                 if libc::chdir(cwd_c.as_ptr()) != 0 {
                     let errno = Errno::last() as i32;
                     write_errno(write_raw, errno);

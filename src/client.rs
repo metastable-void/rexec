@@ -1,25 +1,43 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+use nix::libc;
 
 use crate::cli::RunArgs;
-use crate::protocol::{ERROR_NOT_FOUND, Request, Response, TranscriptEntry};
+use crate::protocol::{
+    ABORT_LINE, ControlResponse, ERROR_NOT_FOUND, PING_LINE, Request, Response, TranscriptEntry,
+};
 use crate::socket;
 use crate::transcript;
 
 pub fn check_host() -> i32 {
-    match UnixStream::connect(socket::socket_path()) {
-        Ok(stream) => {
-            drop(stream);
-            println!("HOST RUNNING");
-            0
-        }
+    let stream = match UnixStream::connect(socket::socket_path()) {
+        Ok(s) => s,
         Err(_) => {
             println!("HOST NOT FOUND");
-            127
+            return 127;
         }
-    }
+    };
+
+    // Send the dedicated ping. A current host replies with `{"result":"pong"}`
+    // and closes; an older host will log it as a malformed request but still
+    // proves it's running by virtue of the successful connect.
+    let mut writer = &stream;
+    let _ = writer.write_all(PING_LINE);
+    let _ = writer.flush();
+
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+    let _ = serde_json::from_str::<ControlResponse>(line.trim_end());
+
+    println!("HOST RUNNING");
+    0
 }
 
 pub fn run(args: RunArgs) -> i32 {
@@ -44,15 +62,32 @@ pub fn run(args: RunArgs) -> i32 {
         envs.insert(k, v);
     }
 
+    let stdin = if args.read_stdin {
+        match read_stdin_to_string() {
+            Ok(s) => Some(s),
+            Err(err) => {
+                eprintln!("rexec: failed to read stdin: {err}");
+                return 127;
+            }
+        }
+    } else {
+        None
+    };
+
     let request = Request {
         whoami: args.whoami,
         dir: dir_str,
         envs,
         exec: args.argv.clone(),
+        stdin,
     };
+
+    install_abort_handlers();
+    let mut abort_guard = AbortGuard::arm(stream.as_raw_fd());
 
     if let Err(err) = send_request(&stream, &request) {
         eprintln!("rexec: failed to send request: {err}");
+        abort_guard.disarm();
         return 127;
     }
 
@@ -60,9 +95,12 @@ pub fn run(args: RunArgs) -> i32 {
         Ok(r) => r,
         Err(err) => {
             eprintln!("rexec: failed to read response: {err}");
+            abort_guard.disarm();
             return 127;
         }
     };
+
+    abort_guard.disarm();
 
     if response.error.as_deref() == Some(ERROR_NOT_FOUND) {
         let arg0 = args.argv.first().map(String::as_str).unwrap_or("");
@@ -82,6 +120,76 @@ pub fn run(args: RunArgs) -> i32 {
     }
 
     response.exit
+}
+
+// Stream fd used by the signal handler to write the abort line. -1 = not armed.
+static ABORT_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn abort_signal_handler(signum: libc::c_int) {
+    let fd = ABORT_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // async-signal-safe: write() on a short buffer.
+        unsafe {
+            libc::write(fd, ABORT_LINE.as_ptr().cast(), ABORT_LINE.len());
+        }
+    }
+    // Restore default disposition and re-raise so the process actually dies.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(signum, &sa, std::ptr::null_mut());
+        libc::raise(signum);
+    }
+}
+
+fn install_abort_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = abort_signal_handler as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+    }
+}
+
+// Sends the abort line on drop unless explicitly disarmed. Covers panics and
+// any path that exits the function without a clean response.
+struct AbortGuard {
+    fd: i32,
+    armed: bool,
+}
+
+impl AbortGuard {
+    fn arm(fd: i32) -> Self {
+        ABORT_FD.store(fd, Ordering::SeqCst);
+        Self { fd, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+        ABORT_FD.store(-1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                libc::write(self.fd, ABORT_LINE.as_ptr().cast(), ABORT_LINE.len());
+            }
+            ABORT_FD.store(-1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn read_stdin_to_string() -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    std::io::stdin().lock().read_to_end(&mut buf)?;
+    String::from_utf8(buf)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin is not valid UTF-8"))
 }
 
 fn send_request(mut stream: &UnixStream, request: &Request) -> std::io::Result<()> {

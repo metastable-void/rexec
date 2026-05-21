@@ -1,81 +1,327 @@
-## rexec - command execution aggregator for AI agents
+# rexec
+
+Command-execution aggregator for AI coding agents.
+
+`rexec` runs a small per-user host that several coding agents (Claude Code,
+Codex, Gemini CLI, ...) can share. Agents call a thin client which forwards
+the command to the host; the host runs it inside a fresh PTY, streams raw
+output to the human's console with a one-line banner, sends ANSI-stripped
+output back to the calling agent, and journals every run to a JSONL
+transcript.
+
+The design assumes one human supervisor and several agents working
+concurrently in the same project. They get a single, ordered, human-readable
+log of what was executed, and the supervisor can interrupt or replay anything
+after the fact.
+
+## Features
+
+- **One shared console.** Output from concurrent agents is serialised one
+  command at a time, so the human's screen stays readable.
+- **Sanitised output to agents.** ANSI escape sequences are stripped and CR is
+  normalised to LF — agents see clean text, not progress-bar redraws.
+- **Live raw output to the human.** The host console preserves ANSI colours
+  and any TTY behaviour.
+- **Fresh PTY per command.** Each command runs as if from a small (80x24)
+  terminal with sane termios.
+- **JSONL transcripts.** Every run is appended to
+  `~/.rexec/YYYY-MM-DD-HH:MM:SS.jsonl` and can be listed, printed, or
+  followed live.
+- **Cooperative abort.** Clients send `{"action":"abort"}` automatically on
+  any catchable termination (Ctrl-C, SIGTERM, panic, dropped connection);
+  the host SIGTERMs the spawned process group then SIGKILLs after a brief
+  grace.
+- **No daemon manager.** The host is just `rexec --start-host` in a terminal;
+  ^C cleans it up. Single static binary, no Python in the build graph,
+  builds cleanly for `musl` targets.
+
+## Install
+
+From crates.io:
 
 ```bash
-rexec --help|-h
+cargo install rexec
+```
 
-# check if the host is running
-# prints: HOST RUNNING/HOST NOT FOUND
-# exits: 0/127
-rexec --check-host|-c
+From source:
 
-# run a command with logging and explicit working directory.
-# optionally with environment variables.
-# prints: whatever the command prints,
-# stdout/stderr aggregated to stdout.
-# if the command is not found, exits 127 with
-# "$0: not found" to stderr.
-# if the host is not running, exits 127 with
-# "HOST NOT FOUND"
-# to stderr. otherwise, the command's exit code is used.
-# command's output is filtered (by host), so ANSI colors are not printed,
-# and "\r" is replaced with "\n".
-# --whoami and --dir are both REQUIRED.
-rexec --whoami Codex --dir /path/to/working/directory [ --env VAR=val ... ] -- my-command --and arguments --as-is
+```bash
+git clone https://github.com/metastable-void/rexec.git
+cd rexec
+cargo install --path .
+```
 
-# start host (^C to interrupt)
-rexec --start-host|-s
+Unix only. Tested on Linux (glibc and musl). BSDs and macOS should work.
 
-# list recent N transcripts (N is required)
+## Quick start
+
+In one terminal — the human's view — start the host:
+
+```bash
+rexec --start-host
+```
+
+It prints the socket path and transcript file:
+
+```
+rexec host listening on /tmp/.rexec-1000
+rexec transcript: ~/.rexec/2026-05-21-09:42:18.jsonl
+```
+
+From an agent (or any other shell), run commands through it:
+
+```bash
+rexec --whoami "Claude Code" --dir "$PWD" -- grep -v foo bar.txt
+```
+
+The host prints a banner and the command's raw output to its own console;
+the client receives the ANSI-stripped output on stdout and exits with the
+command's exit code.
+
+## CLI
+
+```text
+rexec --help | -h
+rexec --check-host | -c
+rexec --start-host | -s
 rexec --list <N>
-# prints lines like: `2026-05-20-10:10:09 commands=19`
-# where commands= is the count of command executions.
-
-# show transcript in the same format as `--start-host`
-# ANSI colors are already lost, so not displayed.
-rexec --print|-p [--follow|-f] 2026-05-20-10:10:09
+rexec --print | -p [--follow | -f] <transcript-name>
+rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] -- <command> [args...]
 ```
 
-host owns a socket at `/tmp/.rexec-$UID`.
-It refuses to start when the socket is listened by another host.
+### Run a command
 
-It accepts command execution requests in JSON. Printing is
-serialized: commands are executed in the order they arrived, possibly concurrently, but printing is one-by-one, waiting for
-another running commands to finish, before printing the arguments,
-etc. to the human console.
+```bash
+rexec --whoami Codex --dir /path/to/repo --env RUST_LOG=debug -- cargo test --workspace
+```
 
-JSON requests:
+| Flag           | Required | Description |
+|----------------|----------|-------------|
+| `--whoami`     | yes      | Identifier of the calling agent. Appears in the host banner and transcript. |
+| `--dir`        | yes      | Working directory for the child. The host `chdir`s here. |
+| `--env`        | no       | `VAR=VAL` pairs, repeatable. Added to (not replacing) the host's environment. |
+| `--read-stdin` | no       | Read the client's stdin to EOF (must be valid UTF-8) and forward it to the child. The host attaches a pipe to the child's fd 0 and closes it after writing, so the child sees a real EOF. Without this flag the child's stdin is the PTY slave and reads on it will block. |
+| `--`           | yes      | Separator; everything after is the command to execute. |
+
+`argv[0]` is resolved via `PATH` (`execvp` semantics). Output to stdout is
+the command's combined stdout+stderr, ANSI-stripped, CR-normalised. The
+client's exit code is:
+
+| Code  | Meaning |
+|-------|---------|
+| *N*   | The command's exit code. |
+| 128+N | The command was killed by signal *N*. |
+| 127   | Host not running (`HOST NOT FOUND` on stderr), command not found (`<arg0>: not found` on stderr), spawn failure, or a transport error. |
+| 2     | CLI usage error. |
+
+### Check whether the host is up
+
+```bash
+rexec --check-host
+```
+
+Prints `HOST RUNNING` (exit 0) or `HOST NOT FOUND` (exit 127).
+
+### Start the host
+
+```bash
+rexec --start-host
+```
+
+Foreground; ^C to stop. Refuses to start if another host already owns the
+per-user socket. On exit the socket file is removed.
+
+### List transcripts
+
+```bash
+rexec --list 10
+```
+
+Lists up to *N* most recent transcripts, newest first:
+
+```
+2026-05-21-09:42:18 commands=19
+2026-05-20-17:03:55 commands=4
+```
+
+### Print a transcript
+
+```bash
+rexec --print 2026-05-21-09:42:18
+rexec --print --follow 2026-05-21-09:42:18
+```
+
+Renders the transcript in the same format the host prints to its console.
+`--follow` (`-f`) streams new entries as they arrive.
+
+## Architecture
+
+The host owns a Unix domain socket at `/tmp/.rexec-$UID` (mode `0600`, owner
+only). Clients open a fresh connection per command — there is no persistent
+client state.
+
+```
++----------------+              +---------------------------+              +---------------+
+|  agent / shell |              |          host             |    forkpty   |    child      |
+|  rexec client  | ---JSONL---> |  accept; per-conn worker  | -----------> | (fresh PTY)   |
+|                | <--JSONL---- |  PTY -> host stdout (raw) |              +---------------+
++----------------+              |  PTY -> client (filtered) |
+                                |  append transcript line   |
+                                +---------------------------+
+```
+
+- **Concurrency vs. ordering.** Commands run concurrently, but *printing to
+  the host console* is serialised. The Nth-arriving request gets sequence
+  number N and waits its turn to print the banner and output. Each client
+  sees its own command's output independently, so a slow command never
+  blocks a fast one from completing on the client side.
+- **PTY.** Each command runs under a fresh 80x24 PTY with sane termios
+  (B38400, `CS8`, no input/output processing). This gives realistic TTY
+  behaviour for tools that detect a terminal, without leaking the host's
+  controlling terminal.
+- **Environment.** The child inherits the host's environment, with anything
+  passed via `--env` added or overriding. `HOME`, `PATH`, etc. come from the
+  host process unless the request supplies them.
+- **Filtering.** Output sent back to the client passes through an
+  ANSI-stripping filter: CSI sequences, OSC strings (terminated by BEL or
+  ST), and single-character ESC sequences are removed; CR becomes LF so
+  redraws appear as separate lines. The host's own console sees the raw
+  PTY bytes.
+
+## Protocol
+
+The client opens a fresh socket per command and exchanges JSONL — one JSON
+object per line — with the host.
+
+The first line of every connection is one of:
+
+- a **Request** (run a command — no `"action"` field), or
+- a **Ping** action (`{"action":"ping"}`), to which the host replies
+  `{"result":"pong"}` and closes. This is what `--check-host` sends.
+
+After a Request, the client may send further JSONL action lines (currently
+only **Abort**) on the same connection.
+
+### 1. Request (client → host)
+
+The first line is the request:
+
 ```json
-{"whoami":"Claude Code","dir":"/path/to/directory","envs":{},"exec":["grep","-v","foo","bar.txt"]}
+{"whoami":"Claude Code","dir":"/path/to/repo","envs":{"RUST_LOG":"debug"},"exec":["grep","-v","foo","bar.txt"]}
 ```
 
-JSON responses:
+| Field    | Type                  | Description |
+|----------|-----------------------|-------------|
+| `whoami` | string                | Identifier of the calling agent. |
+| `dir`    | string                | Working directory; the host `chdir`s the child here. |
+| `envs`   | object<string,string> | Environment variables added to the child. Omittable. |
+| `exec`   | array<string>         | `argv[0]` is the program (resolved via `PATH`); rest are arguments. Must be non-empty. |
+| `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, the child's stdin is the PTY slave and reads on it block. |
+
+### 2. Response (host → client)
+
+The host writes one line back when the command completes:
 
 ```json
 {"exit":0,"output":"foobar\n"}
 ```
 
-The client side opens a new socket each time, so it is not ambiguous.
+| Field    | Type   | Description |
+|----------|--------|-------------|
+| `exit`   | int    | Exit code. `128+N` if the child was killed by signal *N*; `127` if not found or spawn failed. |
+| `output` | string | Filtered combined stdout+stderr (ANSI-stripped, CR→LF). |
+| `error`  | string (optional) | Tag describing why the run did not complete normally. See below. |
 
-host is started by the human developer at the start of a session.
-It prints something like for them:
+`error` values currently defined:
 
-```
-[2026-05-11T10:57:44Z] Claude Code:/path/to/dir $ grep -v foo bar.txt
-foobar
-# (extra new line)
-```
+| Tag            | Meaning |
+|----------------|---------|
+| `not_found`    | `execvp` reported `ENOENT` (or similar) for `argv[0]`. |
+| `spawn_failed` | `chdir`, `setenv`, or `fork` failed before exec. |
+| `aborted`      | The host killed the child because the client sent `abort` or disconnected. |
 
-Host's console outputs include ANSI colors as-is.
+### 3. Ping / Pong (client ↔ host)
 
-The host opens a JSONL transcript file (creating it) at the
-start of the session at `~/.rexec/YYYY-MM-DD-hh:mm:ss.jsonl`.
-It contains something like:
+Sent as the first (and only) message on a connection used purely to probe
+the host:
 
 ```json
-{"whoami":"Claude Code","dir":"/path/to/directory","envs":{},"exec":["grep","-v","foo","bar.txt"],"exit":0,"output":"foobar\n"}
-{"whoami":"Codex","dir":"/path/to/directory","envs":{},"exec":["id","-un"],"exit":0,"output":"1000\n"}
+{"action":"ping"}
 ```
 
-Host executes each command inside a properly configured fresh
-PTY. PTY outputs are collected, and displayed at the host
-console, and sent back to the client.
+The host replies:
+
+```json
+{"result":"pong"}
+```
+
+and closes the connection. `--check-host` uses this. A successful connect
+to the socket alone is also accepted as proof that the host is running, so
+new clients still report `HOST RUNNING` against older hosts that don't know
+the ping action.
+
+### 4. Abort (client → host, optional)
+
+At any point after the request, the client may send:
+
+```json
+{"action":"abort"}
+```
+
+The reference client sends this automatically on any catchable termination
+(SIGINT, SIGTERM, SIGHUP, panic, or any drop of the connection before the
+response is read). On receipt the host signals the child's process group
+with SIGTERM, then SIGKILL after a 200 ms grace, and tags the transcript
+entry with `"error":"aborted"`. Clients that don't implement abort remain
+fully compatible — the host treats EOF on the connection identically.
+
+## Host console output
+
+Per command, the host prints:
+
+```
+[2026-05-21T09:42:18Z] Claude Code:/path/to/repo $ grep -v foo bar.txt
+foobar
+                                  <- trailing blank line separates commands
+```
+
+Output between the banner and the trailing blank line is the raw PTY
+stream, including any ANSI colour and cursor control the command produced.
+
+## Transcript format
+
+`~/.rexec/YYYY-MM-DD-HH:MM:SS.jsonl` is JSONL with one object per executed
+command, in arrival order:
+
+```json
+{"whoami":"Claude Code","dir":"/path/to/repo","envs":{},"exec":["grep","-v","foo","bar.txt"],"exit":0,"output":"foobar\n","time":"2026-05-21T09:42:18Z"}
+{"whoami":"Codex","dir":"/path/to/repo","envs":{},"exec":["id","-un"],"exit":0,"output":"alice\n","time":"2026-05-21T09:42:24Z"}
+```
+
+The file is opened with `O_CREAT | O_EXCL`; the host refuses to start if a
+transcript with the same name already exists. Entries are flushed after
+every append, so the transcript is durable up to the last completed
+command.
+
+## Security notes
+
+- The socket is created at mode `0600` and lives in `/tmp/.rexec-$UID`,
+  i.e. it is accessible only to the owning user. Anyone with that user's
+  privileges can run arbitrary commands through the host; treat the host
+  as equivalent to a shell running as you.
+- The host does not authenticate clients beyond filesystem permissions on
+  the socket. Do not start a host as `root` unless you want any process
+  running as that user to be able to execute anything.
+- Output from the child is rendered raw on the host console. A hostile
+  command can emit terminal escape sequences against the human's terminal;
+  this matches `bash`'s default behaviour and is preserved deliberately so
+  the human sees what the command actually produced.
+
+## License
+
+Dual-licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- Mozilla Public License, Version 2.0 ([LICENSE-MPL](LICENSE-MPL))
+
+at your option.

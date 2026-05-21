@@ -44,6 +44,12 @@ pub struct Cli {
     #[arg(long = "env", value_name = "VAR=VAL")]
     pub env: Vec<String>,
 
+    /// Read the client's stdin to EOF and send it to the host to be fed to the
+    /// child's stdin. Without this flag the child's stdin is the PTY slave
+    /// (and reads will block, as nothing is written to it).
+    #[arg(long = "read-stdin")]
+    pub read_stdin: bool,
+
     /// Positional arguments. For run mode: the command and its arguments (use `--`).
     /// For --print: the transcript name.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -66,6 +72,7 @@ pub struct RunArgs {
     pub dir: PathBuf,
     pub envs: Vec<(String, String)>,
     pub argv: Vec<String>,
+    pub read_stdin: bool,
 }
 
 pub fn parse() -> Result<Mode, String> {
@@ -117,5 +124,6 @@ fn dispatch(cli: Cli) -> Result<Mode, String> {
         dir,
         envs,
         argv: cli.args,
+        read_stdin: cli.read_stdin,
     }))
 }

@@ -9,11 +9,15 @@ use std::time::Duration;
 use chrono::Utc;
 use nix::errno::Errno;
 use nix::libc;
+use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::filter::OutputFilter;
-use crate::protocol::{ERROR_NOT_FOUND, Request, Response, TranscriptEntry};
+use crate::protocol::{
+    ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, Request, Response,
+    TranscriptEntry,
+};
 use crate::pty_exec;
 use crate::socket;
 use crate::transcript::TranscriptWriter;
@@ -196,17 +200,45 @@ struct PtyBuffer {
 }
 
 fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
+    let write_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("rexec host: try_clone failed: {err}");
+            return;
+        }
+    };
+
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if let Err(err) = reader.read_line(&mut line) {
-        eprintln!("rexec host: read request: {err}");
+    match reader.read_line(&mut line) {
+        Ok(0) => return, // Connect-then-close probe; nothing to do.
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("rexec host: read request: {err}");
+            return;
+        }
+    }
+    let _ = reader.get_ref().set_read_timeout(None);
+
+    let trimmed = line.trim_end();
+
+    // The first line is either a control action (ping / stray abort) or a
+    // command Request. Try the tagged enum first; on failure fall through to
+    // Request parsing.
+    if let Ok(action) = serde_json::from_str::<ClientAction>(trimmed) {
+        match action {
+            ClientAction::Ping => {
+                let _ = write_control_response(&write_stream, &ControlResponse::Pong);
+            }
+            ClientAction::Abort => {
+                // No run in progress to abort; just close.
+            }
+        }
         return;
     }
-    let stream = reader.into_inner();
-    let _ = stream.set_read_timeout(None);
 
-    let request: Request = match serde_json::from_str(line.trim_end()) {
+    let request: Request = match serde_json::from_str(trimmed) {
         Ok(r) => r,
         Err(err) => {
             eprintln!("rexec host: malformed request: {err}");
@@ -215,7 +247,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                 output: String::new(),
                 error: Some(format!("malformed request: {err}")),
             };
-            let _ = write_response(&stream, &resp);
+            let _ = write_response(&write_stream, &resp);
             return;
         }
     };
@@ -226,7 +258,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
             output: String::new(),
             error: Some("exec is empty".into()),
         };
-        let _ = write_response(&stream, &resp);
+        let _ = write_response(&write_stream, &resp);
         return;
     }
 
@@ -239,7 +271,12 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let spawn_result = pty_exec::spawn(&request.exec, &envs_vec, &request.dir);
+    let spawn_result = pty_exec::spawn(
+        &request.exec,
+        &envs_vec,
+        &request.dir,
+        request.stdin.is_some(),
+    );
 
     let spawned = match spawn_result {
         Ok(s) => s,
@@ -255,7 +292,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                 output: msg.clone(),
                 error: Some("spawn_failed".into()),
             };
-            let _ = write_response(&stream, &resp);
+            let _ = write_response(&write_stream, &resp);
             let _ = host.transcript.append(&TranscriptEntry {
                 whoami: request.whoami,
                 dir: request.dir,
@@ -274,7 +311,18 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         master,
         child,
         errno_pipe_read,
+        stdin_write,
     } = spawned;
+
+    // Feed the child's stdin in the background. The thread closes the pipe on
+    // drop, sending EOF; an unread tail just produces EPIPE which we ignore.
+    if let Some(stdin_fd) = stdin_write {
+        let bytes = request.stdin.clone().unwrap_or_default().into_bytes();
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::from(stdin_fd);
+            let _ = file.write_all(&bytes);
+        });
+    }
 
     let buf = Arc::new((
         Mutex::new(PtyBuffer {
@@ -288,6 +336,10 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
     let reader_buf = buf.clone();
     let reader_handle = std::thread::spawn(move || pty_reader(master, reader_buf));
 
+    // Watch for an explicit `{"action":"abort"}` line (or client EOF) and kill
+    // the child's process group if the client bails before we send a response.
+    let abort_thread = std::thread::spawn(move || abort_watcher(reader, child));
+
     host.print_queue.wait_turn(seq);
     print_banner(&request, &request_time);
 
@@ -298,12 +350,20 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
 
     let _ = reader_handle.join();
 
+    // Wake the abort watcher (locally close the read side) and join it BEFORE
+    // waitpid so it cannot race with PID reuse.
+    let _ = write_stream.shutdown(std::net::Shutdown::Read);
+    let aborted = abort_thread.join().unwrap_or(false);
+
     let exit_code = wait_for_child(child);
     let errno = pty_exec::read_errno(&errno_pipe_read).unwrap_or(None);
 
-    let (response_error, exit_for_response) = match errno {
-        Some(_) => (Some(ERROR_NOT_FOUND.to_string()), 127),
-        None => (None, exit_code),
+    let (response_error, exit_for_response) = if errno.is_some() {
+        (Some(ERROR_NOT_FOUND.to_string()), 127)
+    } else if aborted {
+        (Some(ERROR_ABORTED.to_string()), exit_code)
+    } else {
+        (None, exit_code)
     };
 
     let filtered_output = {
@@ -317,7 +377,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         output: filtered_output.clone(),
         error: response_error.clone(),
     };
-    let _ = write_response(&stream, &response);
+    let _ = write_response(&write_stream, &response);
 
     let entry = TranscriptEntry {
         whoami: request.whoami,
@@ -330,6 +390,43 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         time: Some(request_time),
     };
     let _ = host.transcript.append(&entry);
+}
+
+// Reads JSONL action lines from the client after the initial request. Returns
+// true if an abort was honoured (or the client disconnected while the child was
+// still running). Sends SIGTERM, then SIGKILL after a short grace, to the
+// child's process group (forkpty makes the child a session/PG leader).
+fn abort_watcher(mut reader: BufReader<UnixStream>, child: Pid) -> bool {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) => {
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<ClientAction>(trimmed) {
+                    Ok(ClientAction::Abort) => {
+                        kill_child_group(child);
+                        return true;
+                    }
+                    // A stray ping mid-run is meaningless; ignore it rather
+                    // than treat it as a connection break.
+                    Ok(ClientAction::Ping) => continue,
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn kill_child_group(child: Pid) {
+    let _ = signal::killpg(child, Signal::SIGTERM);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = signal::killpg(child, Signal::SIGKILL);
 }
 
 fn pty_reader(master: OwnedFd, buf: Arc<(Mutex<PtyBuffer>, Condvar)>) {
@@ -447,5 +544,16 @@ fn write_response(stream: &UnixStream, response: &Response) -> std::io::Result<(
     s.flush()?;
     use std::net::Shutdown;
     let _ = stream.shutdown(Shutdown::Write);
+    Ok(())
+}
+
+fn write_control_response(stream: &UnixStream, response: &ControlResponse) -> std::io::Result<()> {
+    let body = serde_json::to_string(response)
+        .map_err(|e| std::io::Error::other(format!("serialize control response: {e}")))?;
+    let mut s = stream;
+    s.write_all(body.as_bytes())?;
+    s.write_all(b"\n")?;
+    s.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
