@@ -14,6 +14,16 @@ use crate::protocol::{
 use crate::socket;
 use crate::transcript;
 
+/// Send a single request to the host and return the response. Used by the
+/// command-line `run` path and by the MCP server. Installs no signal handlers
+/// and does no I/O on stdout/stderr; the caller decides how to render results.
+pub fn exec_blocking(request: &Request) -> Result<Response, String> {
+    let stream = UnixStream::connect(socket::socket_path())
+        .map_err(|_| "HOST NOT FOUND".to_string())?;
+    send_request(&stream, request).map_err(|e| format!("send: {e}"))?;
+    read_response(&stream).map_err(|e| format!("read: {e}"))
+}
+
 pub fn check_host() -> i32 {
     let stream = match UnixStream::connect(socket::socket_path()) {
         Ok(s) => s,

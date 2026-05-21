@@ -32,6 +32,11 @@ pub struct Cli {
     #[arg(short = 'f', long = "follow", requires = "print")]
     pub follow: bool,
 
+    /// Run a stdio MCP server that forwards tool calls to the rexec host.
+    /// Requires --whoami.
+    #[arg(short = 'm', long = "mcp-stdio", conflicts_with_all = ["check_host", "start_host", "list", "print"])]
+    pub mcp_stdio: bool,
+
     /// Identifier of the calling agent (required when running a command).
     #[arg(long = "whoami")]
     pub whoami: Option<String>,
@@ -64,6 +69,7 @@ pub enum Mode {
     List(usize),
     Print { name: String, follow: bool },
     Run(RunArgs),
+    McpStdio { whoami: String },
 }
 
 #[derive(Debug)]
@@ -98,6 +104,15 @@ fn dispatch(cli: Cli) -> Result<Mode, String> {
             name: cli.args.into_iter().next().unwrap(),
             follow: cli.follow,
         });
+    }
+    if cli.mcp_stdio {
+        let whoami = cli
+            .whoami
+            .ok_or_else(|| "--whoami is required with --mcp-stdio".to_string())?;
+        if !cli.args.is_empty() {
+            return Err("--mcp-stdio takes no positional arguments".into());
+        }
+        return Ok(Mode::McpStdio { whoami });
     }
 
     let whoami = cli

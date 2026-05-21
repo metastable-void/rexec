@@ -86,6 +86,7 @@ rexec --check-host | -c
 rexec --start-host | -s
 rexec --list <N>
 rexec --print | -p [--follow | -f] <transcript-name>
+rexec --mcp-stdio | -m --whoami <NAME>
 rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] -- <command> [args...]
 ```
 
@@ -153,6 +154,41 @@ rexec --print --follow 2026-05-21-09:42:18
 
 Renders the transcript in the same format the host prints to its console.
 `--follow` (`-f`) streams new entries as they arrive.
+
+### Run as a stdio MCP server
+
+```bash
+rexec --mcp-stdio --whoami "Claude Code"
+```
+
+Speaks the Model Context Protocol (MCP) over stdio. The agent launches `rexec
+--mcp-stdio --whoami <NAME>` as a subprocess; each tool call becomes a fresh
+client connection to the rexec host, identical to invoking `rexec --whoami ...`
+on the command line. `--whoami` is fixed for the session.
+
+Two tools are exposed:
+
+| Tool         | Purpose |
+|--------------|---------|
+| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
+| `check_host` | Probes the per-user host. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
+
+The MCP server itself does no work other than forwarding — `--start-host` must
+still be running somewhere for `exec` calls to succeed.
+
+Configuration example (Claude Code's `mcp_servers` block, similar shape for
+other MCP clients):
+
+```json
+{
+  "mcpServers": {
+    "rexec": {
+      "command": "rexec",
+      "args": ["--mcp-stdio", "--whoami", "Claude Code"]
+    }
+  }
+}
+```
 
 ## Architecture
 

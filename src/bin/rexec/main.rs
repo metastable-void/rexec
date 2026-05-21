@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use rexec::cli::{self, Mode};
-use rexec::{client, host};
+use rexec::{client, host, mcp};
 
 fn main() -> ExitCode {
     let mode = match cli::parse() {
@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Mode::List(n) => client::list(n),
         Mode::Print { name, follow } => client::print(&name, follow),
         Mode::Run(args) => client::run(args),
+        Mode::McpStdio { whoami } => mcp::run(whoami),
     };
 
     if (0..=255).contains(&code) {

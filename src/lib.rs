@@ -4,6 +4,7 @@ pub mod cli;
 pub mod client;
 pub mod filter;
 pub mod host;
+pub mod mcp;
 pub mod protocol;
 pub mod pty_exec;
 pub mod socket;
