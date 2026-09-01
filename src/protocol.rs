@@ -65,6 +65,18 @@ fn is_zero(value: &u64) -> bool {
 pub enum ClientAction {
     Ping,
     Abort,
+    Attach {
+        /// Send raw PTY output, including ANSI sequences, in transcript events.
+        #[serde(default)]
+        ansi: bool,
+    },
+}
+
+/// A completed transcript entry sent to an attached client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum HostEvent {
+    Transcript { entry: TranscriptEntry },
 }
 
 /// Reply to a control-only request (e.g. a `Ping`). The discriminator is the
@@ -102,5 +114,14 @@ mod tests {
         };
         let value = serde_json::to_value(request).unwrap();
         assert!(value.get("timeout").is_none());
+    }
+
+    #[test]
+    fn attach_action_selects_raw_ansi_output() {
+        let action = ClientAction::Attach { ansi: true };
+        assert_eq!(
+            serde_json::to_string(&action).unwrap(),
+            r#"{"action":"attach","ansi":true}"#
+        );
     }
 }

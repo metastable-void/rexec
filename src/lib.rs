@@ -7,5 +7,6 @@ pub mod host;
 pub mod mcp;
 pub mod protocol;
 pub mod pty_exec;
+pub mod service;
 pub mod socket;
 pub mod transcript;

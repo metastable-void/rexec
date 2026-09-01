@@ -31,9 +31,10 @@ after the fact.
   any catchable termination (Ctrl-C, SIGTERM, panic, dropped connection);
   the host SIGTERMs the spawned process group then SIGKILLs after a brief
   grace.
-- **No daemon manager.** The host is just `rexec --start-host` in a terminal;
-  ^C cleans it up. Single static binary, no Python in the build graph,
-  builds cleanly for `musl` targets.
+- **Optional user service.** `rexec --install` installs and starts a per-user
+  systemd service. The host can still run directly as `rexec --start-host`;
+  ^C cleans it up. Single static binary, no Python in the build graph, builds
+  cleanly for `musl` targets.
 
 ## Install
 
@@ -55,7 +56,16 @@ Unix only. Tested on Linux (glibc and musl). BSDs and macOS should work.
 
 ## Quick start
 
-In one terminal — the human's view — start the host:
+On a systemd Linux host, install and start the user service:
+
+```bash
+rexec --install
+```
+
+The service runs the host silently. Use `rexec --attach` whenever you want a
+live console view.
+
+Alternatively, start the host directly in one terminal:
 
 ```bash
 rexec --start-host
@@ -84,8 +94,11 @@ command's exit code.
 rexec --help | -h
 rexec --check-host | -c
 rexec --start-host | -s
-rexec --list <N>
+rexec --start-host --silent
+rexec --list | -l [N]
 rexec --print | -p [--follow | -f] <transcript-name>
+rexec --attach [--no-color | --force-color]
+rexec --install
 rexec --mcp-stdio | -m --whoami <NAME>
 rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] [--timeout SECONDS] -- <command> [args...]
 ```
@@ -132,20 +145,52 @@ rexec --start-host
 ```
 
 Foreground; ^C to stop. Refuses to start if another host already owns the
-per-user socket. On exit the socket file is removed.
+per-user socket. On exit the socket file is removed. Add `--silent` to suppress
+command banners/output and routine lifecycle notices; errors and diagnostics
+remain visible on stderr. `-s` remains the shorthand for `--start-host`.
 
 ### List transcripts
 
 ```bash
-rexec --list 10
+rexec --list
+rexec -l 25
 ```
 
-Lists up to *N* most recent transcripts, newest first:
+Lists up to 10 recent transcripts by default, newest first. Each transcript's
+name is its creation date. Supply a count to change the maximum:
 
 ```
 2026-05-21-09:42:18 commands=19
 2026-05-20-17:03:55 commands=4
 ```
+
+### Attach to the host
+
+```bash
+rexec --attach
+rexec --attach --no-color
+rexec --attach --force-color
+```
+
+Follows transcript entries completed after attachment until the host exits or
+the attach client is terminated. It does not replay entries that existed before
+attachment. It exits 127 with `HOST NOT FOUND` on stderr when no host is
+running. New entries receive raw pre-filter PTY output when color is enabled, so
+command colors are preserved without storing a second raw transcript. Color is
+enabled when stdout is a terminal, disabled for redirected output or by
+`--no-color`, and forced by `--force-color`.
+
+### Install the user service
+
+```bash
+rexec --install
+```
+
+Writes `rexec.service` under `$XDG_CONFIG_HOME/systemd/user` (or
+`~/.config/systemd/user`), runs `systemctl --user daemon-reload`, then enables
+and starts the service. The unit uses the absolute path of the `rexec`
+executable that performed the installation and starts the host with
+`--start-host --silent`.
 
 ### Print a transcript
 
@@ -175,8 +220,9 @@ Two tools are exposed:
 | `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
 | `check_host` | Probes the per-user host. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
 
-The MCP server itself does no work other than forwarding — `--start-host` must
-still be running somewhere for `exec` calls to succeed.
+The MCP server itself does no work other than forwarding — a host started
+directly or through the user service must be running for `exec` calls to
+succeed.
 
 Configuration example (Claude Code's `mcp_servers` block, similar shape for
 other MCP clients):
@@ -240,7 +286,9 @@ The first line of every connection is one of:
 
 - a **Request** (run a command — no `"action"` field), or
 - a **Ping** action (`{"action":"ping"}`), to which the host replies
-  `{"result":"pong"}` and closes. This is what `--check-host` sends.
+  `{"result":"pong"}` and closes. This is what `--check-host` sends, or
+- an **Attach** action (`{"action":"attach","ansi":true}`), after which the
+  host sends transcript events until it exits or the client disconnects.
 
 After a Request, the client may send further JSONL action lines (currently
 only **Abort**) on the same connection.
@@ -319,6 +367,19 @@ response is read). On receipt the host signals the child's process group
 with SIGTERM, then SIGKILL after a 200 ms grace, and tags the transcript
 entry with `"error":"aborted"`. Clients that don't implement abort remain
 fully compatible — the host treats EOF on the connection identically.
+
+### 5. Attach events (host → client)
+
+An attach client requests raw or filtered output with the `ansi` boolean. The
+host sends each entry completed after attachment as a JSONL event:
+
+```json
+{"event":"transcript","entry":{"whoami":"Codex","dir":"/tmp","envs":{},"exec":["printf","ok\\n"],"exit":0,"output":"ok\\n","time":"2026-05-21T09:42:24Z"}}
+```
+
+Entries completed before attachment are not sent. When `ansi` is true, new
+events carry raw PTY output captured before filtering; it is not persisted.
+When the host shuts down it closes all attach streams.
 
 ## Host console output
 

@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -17,8 +17,8 @@ use nix::unistd::Pid;
 
 use crate::filter::OutputFilter;
 use crate::protocol::{
-    ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, ERROR_TIMEOUT, Request,
-    Response, TranscriptEntry,
+    ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, ERROR_TIMEOUT, HostEvent,
+    Request, Response, TranscriptEntry,
 };
 use crate::pty_exec;
 use crate::socket;
@@ -78,6 +78,7 @@ struct HostState {
     next_seq: AtomicU64,
     print_queue: Arc<PrintQueue>,
     transcript: TranscriptQueue,
+    silent: bool,
 }
 
 struct TranscriptQueue {
@@ -87,7 +88,19 @@ struct TranscriptQueue {
 
 struct TranscriptQueueState {
     next: u64,
-    pending: BTreeMap<u64, TranscriptEntry>,
+    pending: BTreeMap<u64, TranscriptRecord>,
+    subscribers: Vec<TranscriptSubscriber>,
+}
+
+#[derive(Clone)]
+struct TranscriptRecord {
+    entry: TranscriptEntry,
+    raw_output: String,
+}
+
+struct TranscriptSubscriber {
+    ansi: bool,
+    sender: Sender<TranscriptEntry>,
 }
 
 impl TranscriptQueue {
@@ -97,25 +110,53 @@ impl TranscriptQueue {
             state: Mutex::new(TranscriptQueueState {
                 next: 0,
                 pending: BTreeMap::new(),
+                subscribers: Vec::new(),
             }),
         }
     }
 
-    fn submit(&self, seq: u64, entry: TranscriptEntry) {
+    fn submit(&self, seq: u64, entry: TranscriptEntry, raw_output: String) {
         let mut state = self.state.lock().unwrap();
-        state.pending.insert(seq, entry);
+        state
+            .pending
+            .insert(seq, TranscriptRecord { entry, raw_output });
         loop {
             let next = state.next;
-            let Some(entry) = state.pending.remove(&next) else {
+            let Some(record) = state.pending.remove(&next) else {
                 break;
             };
-            let _ = self.writer.append(&entry);
+            let _ = self.writer.append(&record.entry);
+            state.subscribers.retain(|subscriber| {
+                let mut entry = record.entry.clone();
+                if subscriber.ansi {
+                    entry.output.clone_from(&record.raw_output);
+                }
+                subscriber.sender.send(entry).is_ok()
+            });
             state.next += 1;
         }
+    }
+
+    fn subscribe(&self, ansi: bool) -> Receiver<TranscriptEntry> {
+        let mut state = self.state.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        state
+            .subscribers
+            .push(TranscriptSubscriber { ansi, sender: send });
+        receive
+    }
+
+    fn close_subscriptions(&self) {
+        self.state.lock().unwrap().subscribers.clear();
     }
 }
 
 pub fn run() -> std::io::Result<()> {
+    run_with_options(false)
+}
+
+pub fn run_with_options(silent: bool) -> std::io::Result<()> {
+    SHUTDOWN.store(false, Ordering::SeqCst);
     let path = socket::socket_path();
 
     let listener = bind_with_stale_takeover(&path)?;
@@ -138,13 +179,16 @@ pub fn run() -> std::io::Result<()> {
         std::io::Error::other(format!("failed to open transcript {session_name}: {e}"))
     })?;
 
-    eprintln!("rexec host listening on {}", path.display());
-    eprintln!("rexec transcript: ~/.rexec/{session_name}.jsonl");
+    if !silent {
+        eprintln!("rexec host listening on {}", path.display());
+        eprintln!("rexec transcript: ~/.rexec/{session_name}.jsonl");
+    }
 
     let state = Arc::new(HostState {
         next_seq: AtomicU64::new(0),
         print_queue: Arc::new(PrintQueue::new()),
         transcript: TranscriptQueue::new(transcript),
+        silent,
     });
 
     let listener_fd = listener.as_raw_fd();
@@ -194,27 +238,28 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
+    state.transcript.close_subscriptions();
     drop(listener);
     let _ = std::fs::remove_file(&path);
-    eprintln!("rexec host: shutdown");
+    if !silent {
+        eprintln!("rexec host: shutdown");
+    }
     Ok(())
 }
 
 fn bind_with_stale_takeover(path: &std::path::Path) -> std::io::Result<UnixListener> {
     match UnixListener::bind(path) {
         Ok(l) => Ok(l),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            match UnixStream::connect(path) {
-                Ok(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "another rexec host is already running",
-                )),
-                Err(_) => {
-                    std::fs::remove_file(path)?;
-                    UnixListener::bind(path)
-                }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => match UnixStream::connect(path) {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another rexec host is already running",
+            )),
+            Err(_) => {
+                std::fs::remove_file(path)?;
+                UnixListener::bind(path)
             }
-        }
+        },
         Err(e) => Err(e),
     }
 }
@@ -242,8 +287,10 @@ fn install_sigint_handler() -> std::io::Result<()> {
 
 struct PtyBuffer {
     raw_pending: Vec<u8>,
+    raw_total: Vec<u8>,
     filtered_total: Vec<u8>,
     eof: bool,
+    console_output: bool,
 }
 
 fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
@@ -281,6 +328,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
             ClientAction::Abort => {
                 // No run in progress to abort; just close.
             }
+            ClientAction::Attach { ansi } => serve_attachment(write_stream, &host, ansi),
         }
         return;
     }
@@ -334,6 +382,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                 request.clone(),
                 request_time.clone(),
                 None,
+                host.silent,
             );
 
             let msg = format!("rexec: failed to spawn command: {err}\n");
@@ -352,10 +401,11 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                     exec: request.exec,
                     timeout: request.timeout,
                     exit: 127,
-                    output: msg,
+                    output: msg.clone(),
                     error: Some("spawn_failed".into()),
                     time: Some(request_time),
                 },
+                msg,
             );
             return;
         }
@@ -381,8 +431,10 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
     let buf = Arc::new((
         Mutex::new(PtyBuffer {
             raw_pending: Vec::new(),
+            raw_total: Vec::new(),
             filtered_total: Vec::new(),
             eof: false,
+            console_output: !host.silent,
         }),
         Condvar::new(),
     ));
@@ -423,6 +475,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         request.clone(),
         request_time.clone(),
         Some(buf.clone()),
+        host.silent,
     );
 
     let _ = reader_handle.join();
@@ -457,6 +510,11 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         let g = lock.lock().unwrap();
         String::from_utf8_lossy(&g.filtered_total).into_owned()
     };
+    let raw_output = {
+        let (lock, _) = &*buf;
+        let g = lock.lock().unwrap();
+        String::from_utf8_lossy(&g.raw_total).into_owned()
+    };
 
     let response = Response {
         exit: exit_for_response,
@@ -476,7 +534,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         error: response_error,
         time: Some(request_time),
     };
-    host.transcript.submit(seq, entry);
+    host.transcript.submit(seq, entry, raw_output);
 }
 
 fn timeout_expired(cancel: &Receiver<()>, timeout: Duration) -> bool {
@@ -489,8 +547,12 @@ fn queue_console_output(
     request: Request,
     request_time: String,
     buf: Option<Arc<(Mutex<PtyBuffer>, Condvar)>>,
+    silent: bool,
 ) -> std::thread::JoinHandle<()> {
     queue_in_print_order(print_queue, seq, move || {
+        if silent {
+            return;
+        }
         print_banner(&request, &request_time);
         if let Some(buf) = buf {
             drain_to_stdout(&buf);
@@ -538,7 +600,7 @@ fn abort_watcher(mut reader: BufReader<UnixStream>, child: Pid) -> bool {
                     }
                     // A stray ping mid-run is meaningless; ignore it rather
                     // than treat it as a connection break.
-                    Ok(ClientAction::Ping) => continue,
+                    Ok(ClientAction::Ping | ClientAction::Attach { .. }) => continue,
                     Err(_) => continue,
                 }
             }
@@ -564,7 +626,10 @@ fn pty_reader(master: OwnedFd, buf: Arc<(Mutex<PtyBuffer>, Condvar)>) {
             Ok(n) => {
                 let chunk = &tmp[..n];
                 let mut g = lock.lock().unwrap();
-                g.raw_pending.extend_from_slice(chunk);
+                if g.console_output {
+                    g.raw_pending.extend_from_slice(chunk);
+                }
+                g.raw_total.extend_from_slice(chunk);
                 filter.push(chunk, &mut g.filtered_total);
                 cv.notify_all();
             }
@@ -641,7 +706,8 @@ fn print_extra_newline() {
 
 fn shell_quote(arg: &str) -> Cow<'_, str> {
     fn is_safe(c: char) -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.' | '+' | ':' | '@' | '=' | ',' | '%')
+        c.is_ascii_alphanumeric()
+            || matches!(c, '-' | '_' | '/' | '.' | '+' | ':' | '@' | '=' | ',' | '%')
     }
     if !arg.is_empty() && arg.chars().all(is_safe) {
         return Cow::Borrowed(arg);
@@ -680,6 +746,53 @@ fn write_control_response(stream: &UnixStream, response: &ControlResponse) -> st
     s.flush()?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
+}
+
+fn serve_attachment(mut stream: UnixStream, host: &HostState, ansi: bool) {
+    let receive = host.transcript.subscribe(ansi);
+    loop {
+        match receive.recv_timeout(Duration::from_millis(250)) {
+            Ok(entry) => {
+                if write_host_event(&mut stream, entry).is_err() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if attachment_disconnected(&stream) {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn write_host_event(stream: &mut UnixStream, entry: TranscriptEntry) -> std::io::Result<()> {
+    let event = HostEvent::Transcript { entry };
+    let body = serde_json::to_string(&event)
+        .map_err(|err| std::io::Error::other(format!("serialize host event: {err}")))?;
+    stream.write_all(body.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+fn attachment_disconnected(stream: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    let result = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result == 0 {
+        return true;
+    }
+    if result > 0 {
+        return false;
+    }
+    !matches!(Errno::last(), Errno::EAGAIN | Errno::EINTR)
 }
 
 #[cfg(test)]
@@ -726,5 +839,13 @@ mod tests {
         receive.recv_timeout(Duration::from_secs(1)).unwrap();
         handle.join().unwrap();
         assert_eq!(*print_queue.next.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn attachment_disconnect_is_detected_without_an_event() {
+        let (host_end, client_end) = UnixStream::pair().unwrap();
+        assert!(!attachment_disconnected(&host_end));
+        drop(client_end);
+        assert!(attachment_disconnected(&host_end));
     }
 }

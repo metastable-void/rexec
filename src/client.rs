@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::libc;
 
-use crate::cli::RunArgs;
+use crate::cli::{ColorChoice, RunArgs};
 use crate::protocol::{
-    ABORT_LINE, ControlResponse, ERROR_NOT_FOUND, PING_LINE, Request, Response, TranscriptEntry,
+    ABORT_LINE, ClientAction, ControlResponse, ERROR_NOT_FOUND, HostEvent, PING_LINE, Request,
+    Response, TranscriptEntry,
 };
 use crate::socket;
 use crate::transcript;
@@ -18,8 +19,8 @@ use crate::transcript;
 /// command-line `run` path and by the MCP server. Installs no signal handlers
 /// and does no I/O on stdout/stderr; the caller decides how to render results.
 pub fn exec_blocking(request: &Request) -> Result<Response, String> {
-    let stream = UnixStream::connect(socket::socket_path())
-        .map_err(|_| "HOST NOT FOUND".to_string())?;
+    let stream =
+        UnixStream::connect(socket::socket_path()).map_err(|_| "HOST NOT FOUND".to_string())?;
     send_request(&stream, request).map_err(|e| format!("send: {e}"))?;
     read_response(&stream).map_err(|e| format!("read: {e}"))
 }
@@ -199,8 +200,9 @@ impl Drop for AbortGuard {
 fn read_stdin_to_string() -> std::io::Result<String> {
     let mut buf = Vec::new();
     std::io::stdin().lock().read_to_end(&mut buf)?;
-    String::from_utf8(buf)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin is not valid UTF-8"))
+    String::from_utf8(buf).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin is not valid UTF-8")
+    })
 }
 
 fn send_request(mut stream: &UnixStream, request: &Request) -> std::io::Result<()> {
@@ -234,6 +236,62 @@ pub fn list(limit: usize) -> i32 {
         Err(err) => {
             eprintln!("rexec: failed to list transcripts: {err}");
             127
+        }
+    }
+}
+
+pub fn attach(color: ColorChoice) -> i32 {
+    let ansi = match color {
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+        ColorChoice::Never => false,
+        ColorChoice::Always => true,
+    };
+    let stream = match UnixStream::connect(socket::socket_path()) {
+        Ok(stream) => stream,
+        Err(_) => {
+            eprintln!("HOST NOT FOUND");
+            return 127;
+        }
+    };
+    let action = ClientAction::Attach { ansi };
+    let body = match serde_json::to_string(&action) {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!("rexec: cannot create attach request: {err}");
+            return 127;
+        }
+    };
+    let mut writer = &stream;
+    if writer.write_all(body.as_bytes()).is_err()
+        || writer.write_all(b"\n").is_err()
+        || writer.flush().is_err()
+    {
+        eprintln!("rexec: failed to attach to host");
+        return 127;
+    }
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return 0,
+            Ok(_) => {
+                let event = match serde_json::from_str::<HostEvent>(line.trim_end()) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        eprintln!("rexec: invalid attach response: {err}");
+                        return 127;
+                    }
+                };
+                match event {
+                    HostEvent::Transcript { entry } => render_entry(&entry, ansi),
+                }
+            }
+            Err(err) => {
+                eprintln!("rexec: error reading attached host: {err}");
+                return 127;
+            }
         }
     }
 }
@@ -298,37 +356,65 @@ fn render_until_eof(path: &Path, offset: &mut u64) -> std::io::Result<()> {
         if let Ok(text) = std::str::from_utf8(line)
             && let Ok(entry) = serde_json::from_str::<TranscriptEntry>(text.trim_end())
         {
-            render_entry(&entry);
+            render_entry(&entry, false);
         }
     }
     *offset += consumed as u64;
     Ok(())
 }
 
-fn render_entry(entry: &TranscriptEntry) {
+fn render_entry(entry: &TranscriptEntry, ansi: bool) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let _ = render_entry_to(&mut out, entry, ansi);
+    let _ = out.flush();
+}
+
+fn render_entry_to(
+    out: &mut impl Write,
+    entry: &TranscriptEntry,
+    ansi: bool,
+) -> std::io::Result<()> {
     let mut header = String::new();
     if let Some(ts) = &entry.time {
+        if ansi {
+            header.push_str("\x1b[2m");
+        }
         header.push('[');
         header.push_str(ts);
         header.push_str("] ");
+        if ansi {
+            header.push_str("\x1b[0m");
+        }
+    }
+    if ansi {
+        header.push_str("\x1b[1;36m");
     }
     header.push_str(&entry.whoami);
+    if ansi {
+        header.push_str("\x1b[0m");
+    }
     header.push(':');
+    if ansi {
+        header.push_str("\x1b[34m");
+    }
     header.push_str(&entry.dir);
-    header.push_str(" $");
+    if ansi {
+        header.push_str("\x1b[0m \x1b[1;33m$\x1b[0m");
+    } else {
+        header.push_str(" $");
+    }
     for arg in &entry.exec {
         header.push(' ');
         header.push_str(&shell_quote(arg));
     }
-    let _ = writeln!(out, "{header}");
-    let _ = out.write_all(entry.output.as_bytes());
+    writeln!(out, "{header}")?;
+    out.write_all(entry.output.as_bytes())?;
     if !entry.output.ends_with('\n') {
-        let _ = out.write_all(b"\n");
+        out.write_all(b"\n")?;
     }
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 fn shell_quote(arg: &str) -> std::borrow::Cow<'_, str> {
@@ -351,4 +437,38 @@ fn shell_quote(arg: &str) -> std::borrow::Cow<'_, str> {
     }
     s.push('\'');
     Cow::Owned(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(output: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            whoami: "agent".into(),
+            dir: "/tmp".into(),
+            envs: BTreeMap::new(),
+            exec: vec!["printf".into(), "red".into()],
+            timeout: 0,
+            exit: 0,
+            output: output.into(),
+            error: None,
+            time: Some("2026-09-01T00:00:00Z".into()),
+        }
+    }
+
+    #[test]
+    fn attach_renderer_colors_headers_and_preserves_raw_output() {
+        let mut rendered = Vec::new();
+        render_entry_to(&mut rendered, &entry("\x1b[31mred\x1b[0m\n"), true).unwrap();
+        assert!(rendered.starts_with(b"\x1b[2m["));
+        assert!(rendered.windows(9).any(|part| part == b"\x1b[31mred\x1b"));
+    }
+
+    #[test]
+    fn plain_renderer_introduces_no_ansi_sequences() {
+        let mut rendered = Vec::new();
+        render_entry_to(&mut rendered, &entry("red\n"), false).unwrap();
+        assert!(!rendered.contains(&0x1b));
+    }
 }
