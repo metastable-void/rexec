@@ -87,7 +87,7 @@ rexec --start-host | -s
 rexec --list <N>
 rexec --print | -p [--follow | -f] <transcript-name>
 rexec --mcp-stdio | -m --whoami <NAME>
-rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] -- <command> [args...]
+rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] [--timeout SECONDS] -- <command> [args...]
 ```
 
 ### Run a command
@@ -101,7 +101,8 @@ rexec --whoami Codex --dir /path/to/repo --env RUST_LOG=debug -- cargo test --wo
 | `--whoami`     | yes      | Identifier of the calling agent. Appears in the host banner and transcript. |
 | `--dir`        | yes      | Working directory for the child. The host `chdir`s here. |
 | `--env`        | no       | `VAR=VAL` pairs, repeatable. Added to (not replacing) the host's environment. |
-| `--read-stdin` | no       | Read the client's stdin to EOF (must be valid UTF-8) and forward it to the child. The host attaches a pipe to the child's fd 0 and closes it after writing, so the child sees a real EOF. Without this flag the child's stdin is the PTY slave and reads on it will block. |
+| `--read-stdin` | no       | Read the client's stdin to EOF (must be valid UTF-8) and forward it to the child. The host attaches a pipe to the child's fd 0 and closes it after writing, so the child sees a real EOF. Without this flag fd 0 is `/dev/null`. |
+| `--timeout`    | no       | Kill the command's PTY process group after this many seconds. Defaults to `0`, which disables the timeout. |
 | `--`           | yes      | Separator; everything after is the command to execute. |
 
 `argv[0]` is resolved via `PATH` (`execvp` semantics). Output to stdout is
@@ -113,6 +114,7 @@ client's exit code is:
 | *N*   | The command's exit code. |
 | 128+N | The command was killed by signal *N*. |
 | 127   | Host not running (`HOST NOT FOUND` on stderr), command not found (`<arg0>: not found` on stderr), spawn failure, or a transport error. |
+| 124   | The command exceeded `--timeout`. |
 | 2     | CLI usage error. |
 
 ### Check whether the host is up
@@ -170,7 +172,7 @@ Two tools are exposed:
 
 | Tool         | Purpose |
 |--------------|---------|
-| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
+| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
 | `check_host` | Probes the per-user host. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
 
 The MCP server itself does no work other than forwarding — `--start-host` must
@@ -208,13 +210,18 @@ client state.
 
 - **Concurrency vs. ordering.** Commands run concurrently, but *printing to
   the host console* is serialised. The Nth-arriving request gets sequence
-  number N and waits its turn to print the banner and output. Each client
-  sees its own command's output independently, so a slow command never
-  blocks a fast one from completing on the client side.
+  number N and its console worker waits its turn to print the banner and
+  output. If the console is occupied, later raw output is buffered; command
+  completion and the CLI/MCP response do not wait for that printing turn, so
+  a slow command never blocks a fast one from completing on the client side.
 - **PTY.** Each command runs under a fresh 80x24 PTY with sane termios
   (B38400, `CS8`, no input/output processing). This gives realistic TTY
   behaviour for tools that detect a terminal, without leaking the host's
   controlling terminal.
+- **Input.** When `stdin` is supplied, fd 0 is a pipe that is closed after the
+  supplied bytes are written (including when the supplied buffer is empty), so
+  the child sees EOF. Otherwise fd 0 is `/dev/null`; the PTY remains the
+  command's controlling terminal but cannot accidentally act as stdin.
 - **Environment.** The child inherits the host's environment, with anything
   passed via `--env` added or overriding. `HOME`, `PATH`, etc. come from the
   host process unless the request supplies them.
@@ -243,7 +250,7 @@ only **Abort**) on the same connection.
 The first line is the request:
 
 ```json
-{"whoami":"Claude Code","dir":"/path/to/repo","envs":{"RUST_LOG":"debug"},"exec":["grep","-v","foo","bar.txt"]}
+{"whoami":"Claude Code","dir":"/path/to/repo","envs":{"RUST_LOG":"debug"},"exec":["grep","-v","foo","bar.txt"],"timeout":30}
 ```
 
 | Field    | Type                  | Description |
@@ -252,7 +259,8 @@ The first line is the request:
 | `dir`    | string                | Working directory; the host `chdir`s the child here. |
 | `envs`   | object<string,string> | Environment variables added to the child. Omittable. |
 | `exec`   | array<string>         | `argv[0]` is the program (resolved via `PATH`); rest are arguments. Must be non-empty. |
-| `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, the child's stdin is the PTY slave and reads on it block. |
+| `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, fd 0 is `/dev/null`. |
+| `timeout` | integer (optional)   | Maximum runtime in seconds. Defaults to `0`, which disables the timeout. On expiry the host terminates the command's PTY process group. |
 
 ### 2. Response (host → client)
 
@@ -275,6 +283,7 @@ The host writes one line back when the command completes:
 | `not_found`    | `execvp` reported `ENOENT` (or similar) for `argv[0]`. |
 | `spawn_failed` | `chdir`, `setenv`, or `fork` failed before exec. |
 | `aborted`      | The host killed the child because the client sent `abort` or disconnected. |
+| `timeout`      | The command exceeded its requested timeout; the response exit code is 124. |
 
 ### 3. Ping / Pong (client ↔ host)
 

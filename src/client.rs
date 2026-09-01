@@ -90,6 +90,7 @@ pub fn run(args: RunArgs) -> i32 {
         envs,
         exec: args.argv.clone(),
         stdin,
+        timeout: args.timeout,
     };
 
     install_abort_handlers();
@@ -351,4 +352,3 @@ fn shell_quote(arg: &str) -> std::borrow::Cow<'_, str> {
     s.push('\'');
     Cow::Owned(s)
 }
-

@@ -3,9 +3,10 @@ use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use nix::errno::Errno;
-use nix::fcntl::OFlag;
+use nix::fcntl::{OFlag, open};
 use nix::libc;
 use nix::pty::{ForkptyResult, Winsize, forkpty, openpty};
+use nix::sys::stat::Mode;
 use nix::sys::termios::{
     BaudRate, ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
     cfsetspeed, tcgetattr,
@@ -20,7 +21,8 @@ pub struct Spawned {
     pub child: Pid,
     pub errno_pipe_read: OwnedFd,
     /// Write end of a pipe attached to the child's stdin, when the caller
-    /// requested one. Write bytes here and drop to send EOF.
+    /// provided input. Write bytes here and drop to send EOF. Otherwise the
+    /// child's stdin is `/dev/null`.
     pub stdin_write: Option<OwnedFd>,
 }
 
@@ -29,6 +31,7 @@ pub enum SpawnError {
     NulByte(&'static str),
     InvalidEnvName(String),
     Pipe(Errno),
+    Stdin(Errno),
     Open(Errno),
     Termios(Errno),
     Fork(Errno),
@@ -42,6 +45,7 @@ impl fmt::Display for SpawnError {
                 write!(f, "environment variable name contains '=': {name}")
             }
             Self::Pipe(err) => write!(f, "failed to open errno pipe: {err}"),
+            Self::Stdin(err) => write!(f, "failed to open child stdin: {err}"),
             Self::Open(err) => write!(f, "failed to open PTY: {err}"),
             Self::Termios(err) => write!(f, "failed to configure PTY termios: {err}"),
             Self::Fork(err) => write!(f, "failed to fork PTY child: {err}"),
@@ -55,7 +59,7 @@ pub fn spawn(
     argv: &[String],
     envs: &[(String, String)],
     cwd: &str,
-    with_stdin_pipe: bool,
+    stdin_provided: bool,
 ) -> Result<Spawned, SpawnError> {
     if argv.is_empty() {
         return Err(SpawnError::NulByte("argv"));
@@ -84,16 +88,11 @@ pub fn spawn(
 
     let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(SpawnError::Pipe)?;
 
-    // Optional stdin pipe: child reads from read end, parent writes to write end.
-    // O_CLOEXEC keeps the child from inheriting fds it shouldn't; dup2(read, 0)
-    // in the child gives fd 0 (which is not CLOEXEC) and the original cloexec fd
-    // is closed automatically at execvp.
-    let (stdin_read, stdin_write) = if with_stdin_pipe {
-        let (r, w) = pipe2(OFlag::O_CLOEXEC).map_err(SpawnError::Pipe)?;
-        (Some(r), Some(w))
-    } else {
-        (None, None)
-    };
+    // When input was provided, feed it through a pipe. Otherwise attach
+    // /dev/null so commands cannot block waiting for input from their private
+    // PTY. O_CLOEXEC keeps the original fd out of the executed process;
+    // dup2(source, 0) creates the non-CLOEXEC fd 0.
+    let (stdin_read, stdin_write) = stdin_fds(stdin_provided)?;
 
     let winsize = Winsize {
         ws_row: PTY_ROWS,
@@ -111,7 +110,7 @@ pub fn spawn(
     match result {
         ForkptyResult::Parent { child, master } => {
             drop(write_fd);
-            // Parent doesn't read from the stdin pipe.
+            // Parent doesn't read from the child's stdin source.
             drop(stdin_read);
             Ok(Spawned {
                 master,
@@ -122,12 +121,10 @@ pub fn spawn(
         }
         ForkptyResult::Child => {
             let write_raw = write_fd.as_raw_fd();
-            let stdin_read_raw = stdin_read.as_ref().map(|fd| fd.as_raw_fd());
+            let stdin_read_raw = stdin_read.as_raw_fd();
             // SAFETY: we are in the post-fork child.
             unsafe {
-                if let Some(fd) = stdin_read_raw
-                    && libc::dup2(fd, 0) < 0
-                {
+                if libc::dup2(stdin_read_raw, 0) < 0 {
                     let errno = Errno::last() as i32;
                     write_errno(write_raw, errno);
                     libc::_exit(127);
@@ -150,6 +147,21 @@ pub fn spawn(
                 libc::_exit(127);
             }
         }
+    }
+}
+
+fn stdin_fds(stdin_provided: bool) -> Result<(OwnedFd, Option<OwnedFd>), SpawnError> {
+    if stdin_provided {
+        let (r, w) = pipe2(OFlag::O_CLOEXEC).map_err(SpawnError::Pipe)?;
+        Ok((r, Some(w)))
+    } else {
+        let r = open(
+            "/dev/null",
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(SpawnError::Stdin)?;
+        Ok((r, None))
     }
 }
 
@@ -235,4 +247,34 @@ fn set_cc(
     value: libc::cc_t,
 ) {
     termios.control_chars[index as usize] = value;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+
+    use super::*;
+
+    #[test]
+    fn absent_stdin_is_immediate_eof() {
+        let (read_fd, write_fd) = stdin_fds(false).unwrap();
+        assert!(write_fd.is_none());
+        let mut input = std::fs::File::from(read_fd);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn provided_stdin_is_closed_after_payload() {
+        let (read_fd, write_fd) = stdin_fds(true).unwrap();
+        let mut output = std::fs::File::from(write_fd.unwrap());
+        output.write_all(b"payload").unwrap();
+        drop(output);
+
+        let mut input = std::fs::File::from(read_fd);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+    }
 }

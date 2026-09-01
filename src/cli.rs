@@ -50,10 +50,14 @@ pub struct Cli {
     pub env: Vec<String>,
 
     /// Read the client's stdin to EOF and send it to the host to be fed to the
-    /// child's stdin. Without this flag the child's stdin is the PTY slave
-    /// (and reads will block, as nothing is written to it).
+    /// child's stdin. Without this flag the child's stdin is /dev/null.
     #[arg(long = "read-stdin")]
     pub read_stdin: bool,
+
+    /// Kill the command if it is still running after this many seconds.
+    /// Zero disables the timeout.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    pub timeout: u64,
 
     /// Positional arguments. For run mode: the command and its arguments (use `--`).
     /// For --print: the transcript name.
@@ -79,6 +83,7 @@ pub struct RunArgs {
     pub envs: Vec<(String, String)>,
     pub argv: Vec<String>,
     pub read_stdin: bool,
+    pub timeout: u64,
 }
 
 pub fn parse() -> Result<Mode, String> {
@@ -140,5 +145,41 @@ fn dispatch(cli: Cli) -> Result<Mode, String> {
         envs,
         argv: cli.args,
         read_stdin: cli.read_stdin,
+        timeout: cli.timeout,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_defaults_to_zero() {
+        let cli = Cli::try_parse_from(["rexec", "--whoami", "test", "--dir", "/tmp", "--", "true"])
+            .unwrap();
+        let Mode::Run(args) = dispatch(cli).unwrap() else {
+            panic!("expected run mode");
+        };
+        assert_eq!(args.timeout, 0);
+    }
+
+    #[test]
+    fn parses_run_timeout_seconds() {
+        let cli = Cli::try_parse_from([
+            "rexec",
+            "--whoami",
+            "test",
+            "--dir",
+            "/tmp",
+            "--timeout",
+            "17",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Mode::Run(args) = dispatch(cli).unwrap() else {
+            panic!("expected run mode");
+        };
+        assert_eq!(args.timeout, 17);
+    }
 }

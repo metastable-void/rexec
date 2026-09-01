@@ -28,7 +28,8 @@ use crate::protocol::{ERROR_NOT_FOUND, Request};
     name = "exec",
     description = "Run a command via the rexec host (fresh PTY, ANSI-stripped output). \
         Returns a JSON object with `exit`, `output`, and optional `error` fields. \
-        Set `read_stdin` and provide `stdin` to feed the child a UTF-8 buffer.",
+        Provide `stdin` to feed the child a UTF-8 buffer; set `timeout` to a \
+        maximum runtime in seconds (zero disables it).",
     read_only_hint = false,
     destructive_hint = true,
     idempotent_hint = false,
@@ -50,6 +51,9 @@ pub struct ExecTool {
     /// a real EOF rather than blocking on the PTY slave.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
+    /// Maximum runtime in seconds. Zero (the default) disables the timeout.
+    #[serde(default)]
+    pub timeout: u64,
 }
 
 #[mcp_tool(
@@ -97,6 +101,7 @@ impl Handler {
             envs,
             exec: tool.argv,
             stdin: tool.stdin,
+            timeout: tool.timeout,
         };
 
         let response = match client::exec_blocking(&request) {
@@ -245,4 +250,25 @@ pub fn run(whoami: String) -> i32 {
         }
         0
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_timeout_defaults_to_zero() {
+        let tool: ExecTool = serde_json::from_value(serde_json::json!({
+            "dir": "/tmp",
+            "argv": ["true"]
+        }))
+        .unwrap();
+        assert_eq!(tool.timeout, 0);
+    }
+
+    #[test]
+    fn exec_schema_exposes_timeout() {
+        let tools = serde_json::to_value(RexecTools::tools()).unwrap();
+        assert!(tools.to_string().contains("\"timeout\""));
+    }
 }

@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -15,8 +17,8 @@ use nix::unistd::Pid;
 
 use crate::filter::OutputFilter;
 use crate::protocol::{
-    ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, Request, Response,
-    TranscriptEntry,
+    ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, ERROR_TIMEOUT, Request,
+    Response, TranscriptEntry,
 };
 use crate::pty_exec;
 use crate::socket;
@@ -62,10 +64,55 @@ impl PrintQueue {
     }
 }
 
+struct PrintTurn<'a> {
+    queue: &'a PrintQueue,
+}
+
+impl Drop for PrintTurn<'_> {
+    fn drop(&mut self) {
+        self.queue.release();
+    }
+}
+
 struct HostState {
     next_seq: AtomicU64,
-    print_queue: PrintQueue,
-    transcript: TranscriptWriter,
+    print_queue: Arc<PrintQueue>,
+    transcript: TranscriptQueue,
+}
+
+struct TranscriptQueue {
+    writer: TranscriptWriter,
+    state: Mutex<TranscriptQueueState>,
+}
+
+struct TranscriptQueueState {
+    next: u64,
+    pending: BTreeMap<u64, TranscriptEntry>,
+}
+
+impl TranscriptQueue {
+    fn new(writer: TranscriptWriter) -> Self {
+        Self {
+            writer,
+            state: Mutex::new(TranscriptQueueState {
+                next: 0,
+                pending: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn submit(&self, seq: u64, entry: TranscriptEntry) {
+        let mut state = self.state.lock().unwrap();
+        state.pending.insert(seq, entry);
+        loop {
+            let next = state.next;
+            let Some(entry) = state.pending.remove(&next) else {
+                break;
+            };
+            let _ = self.writer.append(&entry);
+            state.next += 1;
+        }
+    }
 }
 
 pub fn run() -> std::io::Result<()> {
@@ -96,8 +143,8 @@ pub fn run() -> std::io::Result<()> {
 
     let state = Arc::new(HostState {
         next_seq: AtomicU64::new(0),
-        print_queue: PrintQueue::new(),
-        transcript,
+        print_queue: Arc::new(PrintQueue::new()),
+        transcript: TranscriptQueue::new(transcript),
     });
 
     let listener_fd = listener.as_raw_fd();
@@ -281,10 +328,13 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
     let spawned = match spawn_result {
         Ok(s) => s,
         Err(err) => {
-            host.print_queue.wait_turn(seq);
-            print_banner(&request, &request_time);
-            print_extra_newline();
-            host.print_queue.release();
+            let _ = queue_console_output(
+                host.print_queue.clone(),
+                seq,
+                request.clone(),
+                request_time.clone(),
+                None,
+            );
 
             let msg = format!("rexec: failed to spawn command: {err}\n");
             let resp = Response {
@@ -293,16 +343,20 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                 error: Some("spawn_failed".into()),
             };
             let _ = write_response(&write_stream, &resp);
-            let _ = host.transcript.append(&TranscriptEntry {
-                whoami: request.whoami,
-                dir: request.dir,
-                envs: request.envs,
-                exec: request.exec,
-                exit: 127,
-                output: msg,
-                error: Some("spawn_failed".into()),
-                time: Some(request_time),
-            });
+            host.transcript.submit(
+                seq,
+                TranscriptEntry {
+                    whoami: request.whoami,
+                    dir: request.dir,
+                    envs: request.envs,
+                    exec: request.exec,
+                    timeout: request.timeout,
+                    exit: 127,
+                    output: msg,
+                    error: Some("spawn_failed".into()),
+                    time: Some(request_time),
+                },
+            );
             return;
         }
     };
@@ -336,19 +390,49 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
     let reader_buf = buf.clone();
     let reader_handle = std::thread::spawn(move || pty_reader(master, reader_buf));
 
+    // Start the timeout as soon as the process is running, rather than when it
+    // reaches the front of the console print queue. The child is a session and
+    // process-group leader, so killing its group also catches pager descendants.
+    let timeout_thread = if request.timeout == 0 {
+        None
+    } else {
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(request.timeout);
+        let handle = std::thread::spawn(move || {
+            if timeout_expired(&cancel_rx, timeout) {
+                kill_child_group(child);
+                true
+            } else {
+                false
+            }
+        });
+        Some((cancel_tx, handle))
+    };
+
     // Watch for an explicit `{"action":"abort"}` line (or client EOF) and kill
     // the child's process group if the client bails before we send a response.
     let abort_thread = std::thread::spawn(move || abort_watcher(reader, child));
 
-    host.print_queue.wait_turn(seq);
-    print_banner(&request, &request_time);
-
-    drain_to_stdout(&buf);
-
-    print_extra_newline();
-    host.print_queue.release();
+    // Console output remains ordered by request arrival, but printing happens
+    // independently of this connection worker. A command that finishes while
+    // an earlier command owns the console can therefore return immediately to
+    // its CLI or MCP caller.
+    let _ = queue_console_output(
+        host.print_queue.clone(),
+        seq,
+        request.clone(),
+        request_time.clone(),
+        Some(buf.clone()),
+    );
 
     let _ = reader_handle.join();
+
+    let timed_out = if let Some((cancel, handle)) = timeout_thread {
+        let _ = cancel.send(());
+        handle.join().unwrap_or(false)
+    } else {
+        false
+    };
 
     // Wake the abort watcher (locally close the read side) and join it BEFORE
     // waitpid so it cannot race with PID reuse.
@@ -360,6 +444,8 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
 
     let (response_error, exit_for_response) = if errno.is_some() {
         (Some(ERROR_NOT_FOUND.to_string()), 127)
+    } else if timed_out {
+        (Some(ERROR_TIMEOUT.to_string()), 124)
     } else if aborted {
         (Some(ERROR_ABORTED.to_string()), exit_code)
     } else {
@@ -384,12 +470,50 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         dir: request.dir,
         envs: request.envs,
         exec: request.exec,
+        timeout: request.timeout,
         exit: exit_for_response,
         output: filtered_output,
         error: response_error,
         time: Some(request_time),
     };
-    let _ = host.transcript.append(&entry);
+    host.transcript.submit(seq, entry);
+}
+
+fn timeout_expired(cancel: &Receiver<()>, timeout: Duration) -> bool {
+    matches!(cancel.recv_timeout(timeout), Err(RecvTimeoutError::Timeout))
+}
+
+fn queue_console_output(
+    print_queue: Arc<PrintQueue>,
+    seq: u64,
+    request: Request,
+    request_time: String,
+    buf: Option<Arc<(Mutex<PtyBuffer>, Condvar)>>,
+) -> std::thread::JoinHandle<()> {
+    queue_in_print_order(print_queue, seq, move || {
+        print_banner(&request, &request_time);
+        if let Some(buf) = buf {
+            drain_to_stdout(&buf);
+        }
+        print_extra_newline();
+    })
+}
+
+fn queue_in_print_order<F>(
+    print_queue: Arc<PrintQueue>,
+    seq: u64,
+    job: F,
+) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::spawn(move || {
+        print_queue.wait_turn(seq);
+        let _turn = PrintTurn {
+            queue: &print_queue,
+        };
+        job();
+    })
 }
 
 // Reads JSONL action lines from the client after the initial request. Returns
@@ -556,4 +680,51 @@ fn write_control_response(stream: &UnixStream, response: &ControlResponse) -> st
     s.flush()?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_wait_can_be_cancelled() {
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(()).unwrap();
+        assert!(!timeout_expired(&receive, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn disconnected_timeout_wait_is_not_an_expiration() {
+        let (send, receive) = std::sync::mpsc::channel();
+        drop(send);
+        assert!(!timeout_expired(&receive, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn timeout_wait_reports_expiration() {
+        let (_send, receive) = std::sync::mpsc::channel();
+        assert!(timeout_expired(&receive, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn queuing_console_output_does_not_wait_for_its_turn() {
+        let print_queue = Arc::new(PrintQueue::new());
+        let (send, receive) = std::sync::mpsc::channel();
+
+        // Sequence 1 cannot print until sequence 0 releases, but enqueueing it
+        // returns a handle immediately instead of waiting on the queue.
+        let handle = queue_in_print_order(print_queue.clone(), 1, move || {
+            send.send(()).unwrap();
+        });
+        assert_eq!(*print_queue.next.lock().unwrap(), 0);
+        assert!(matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        print_queue.release();
+        receive.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(*print_queue.next.lock().unwrap(), 2);
+    }
 }
