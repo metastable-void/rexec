@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SERVICE_NAME: &str = "rexec.service";
+const ENABLE_ARGS: &[&str] = &["--user", "--now", "enable", SERVICE_NAME];
 
 pub fn install() -> Result<PathBuf, String> {
     let executable = std::env::current_exe()
@@ -17,7 +18,7 @@ pub fn install() -> Result<PathBuf, String> {
         .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
 
     run_systemctl(&["--user", "daemon-reload"])?;
-    run_systemctl(&["--user", "enable", "--now", SERVICE_NAME])?;
+    run_systemctl(ENABLE_ARGS)?;
     Ok(path)
 }
 
@@ -91,5 +92,10 @@ mod tests {
             quote_systemd_arg(OsStr::new("/opt/100%/re\\xec\"bin")).unwrap(),
             "\"/opt/100%%/re\\\\xec\\\"bin\""
         );
+    }
+
+    #[test]
+    fn systemctl_options_precede_the_enable_command() {
+        assert_eq!(ENABLE_ARGS, ["--user", "--now", "enable", SERVICE_NAME]);
     }
 }
