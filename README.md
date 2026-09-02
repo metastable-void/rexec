@@ -117,13 +117,13 @@ command's exit code. The banner includes `TO=0` for unlimited execution or
 rexec --help | -h
 rexec --check-host | -c
 rexec --start-host | -s
-rexec --start-host --silent
+rexec --start-host [--silent] [--no-add-path]
 rexec --list | -l [N]
 rexec --print | -p [--follow | -f] <transcript-name>
 rexec --attach [--no-color | --force-color]
 rexec --install
 rexec --mcp-stdio | -m --whoami <NAME>
-rexec --whoami <NAME> --dir <DIR> [--env VAR=VAL ...] [--read-stdin] [--timeout SECONDS] -- <command> [args...]
+rexec --whoami <NAME> --dir <DIR> [--clear-env] [-e|--env VAR=VAL ...] [--read-stdin] [--timeout SECONDS] -- <command> [args...]
 ```
 
 ### Run a command
@@ -136,7 +136,8 @@ rexec --whoami Codex --dir /path/to/repo --env RUST_LOG=debug -- cargo test --wo
 |----------------|----------|-------------|
 | `--whoami`     | yes      | Identifier of the calling agent. Appears in the host banner and transcript. |
 | `--dir`        | yes      | Working directory for the child. The host `chdir`s here. |
-| `--env`        | no       | `VAR=VAL` pairs, repeatable. Added to (not replacing) the host's environment. |
+| `-e`, `--env`  | no       | Unrestricted `VAR=VAL` overrides, repeatable. Applied after inheritance or `--clear-env`; later duplicates win. May override `PATH`. |
+| `--clear-env`  | no       | Remove the inherited environment before applying `--env`. With no `--env`, the child environment is empty. |
 | `--read-stdin` | no       | Read the client's stdin to EOF (must be valid UTF-8) and forward it to the child. The host attaches a pipe to the child's fd 0 and closes it after writing, so the child sees a real EOF. Without this flag fd 0 is `/dev/null`. |
 | `--timeout`    | no       | Kill the command's PTY process group after this many seconds. Defaults to `0`, which disables the timeout. |
 | `--`           | yes      | Separator; everything after is the command to execute. |
@@ -174,7 +175,10 @@ rexec --start-host
 Foreground; ^C to stop. Refuses to start if another host already owns the
 per-user socket. On exit the socket file is removed. Add `--silent` to suppress
 command banners/output and routine lifecycle notices; errors and diagnostics
-remain visible on stderr. `-s` remains the shorthand for `--start-host`.
+remain visible on stderr. By default, existing `$HOME/.local/bin` and
+`$HOME/.cargo/bin` directories are prepended to the host's `PATH` when they are
+not already present. Pass `--no-add-path` to leave `PATH` unchanged. `-s`
+remains the shorthand for `--start-host`.
 
 ### List transcripts
 
@@ -270,7 +274,7 @@ Two tools are exposed:
 
 | Tool         | Purpose |
 |--------------|---------|
-| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
+| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `env` (object of unrestricted environment overrides, required; pass `{}` when none are needed), `clear_env` (boolean, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). `clear_env: true` removes inherited variables before applying `env`, which may override `PATH`. Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
 | `check_host` | Acquires a ping/pong-verified pooled connection, waiting up to 15 seconds if the host is unavailable. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
 
 The MCP server itself does no work other than forwarding — a host started
@@ -328,8 +332,13 @@ its pooled connections until either side disconnects.
   supplied bytes are written (including when the supplied buffer is empty), so
   the child sees EOF. Otherwise fd 0 is `/dev/null`; the PTY remains the
   command's controlling terminal but cannot accidentally act as stdin.
-- **Environment.** The child inherits the host's environment, with anything
-  passed via `--env` added or overriding. `HOME`, `PATH`, etc. come from the
+- **Environment.** The child normally inherits the host's environment, with
+  CLI `-e`/`--env` or MCP `env` entries added or overriding without an
+  allowlist (including `PATH`). CLI `--clear-env` or MCP `clear_env: true`
+  removes inherited variables before applying those overrides. At startup, the
+  host prepends existing
+  `$HOME/.local/bin` and `$HOME/.cargo/bin` directories missing from `PATH`;
+  `--no-add-path` disables this. `HOME`, `PATH`, etc. otherwise come from the
   host process unless the request supplies them.
 - **Filtering.** Output sent back to the client passes through an
   ANSI-stripping filter: CSI sequences, OSC strings (terminated by BEL or
@@ -386,14 +395,15 @@ After the opening handshake and a fresh pre-command ping/pong, send a request
 line:
 
 ```json
-{"whoami":"Claude Code","dir":"/path/to/repo","envs":{"RUST_LOG":"debug"},"exec":["grep","-v","foo","bar.txt"],"timeout":30}
+{"whoami":"Claude Code","dir":"/path/to/repo","envs":{"PATH":"/custom/bin"},"clear_env":true,"exec":["/custom/bin/grep","-v","foo","bar.txt"],"timeout":30}
 ```
 
 | Field    | Type                  | Description |
 |----------|-----------------------|-------------|
 | `whoami` | string                | Identifier of the calling agent. |
 | `dir`    | string                | Working directory; the host `chdir`s the child here. |
-| `envs`   | object<string,string> | Environment variables added to the child. Omittable. |
+| `envs`   | object<string,string> | Unrestricted environment overrides applied to the child. Omittable. |
+| `clear_env` | boolean (optional) | Clear the inherited environment before applying `envs`. Defaults to `false`. |
 | `exec`   | array<string>         | `argv[0]` is the program (resolved via `PATH`); rest are arguments. Must be non-empty. |
 | `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, fd 0 is `/dev/null`. |
 | `timeout` | integer (optional)   | Maximum runtime in seconds. Defaults to `0`, which disables the timeout. On expiry the host terminates the command's PTY process group. |
@@ -482,8 +492,9 @@ The file is opened with `O_CREAT | O_EXCL`; the host refuses to start if a
 transcript with the same name already exists. Entries are flushed after
 every append, so the transcript is durable up to the last completed
 command. The stored `timeout` field is omitted when it is zero for backward
-readability, but live console banners and `--print`/`--attach` rendering always
-show `TO=<seconds>`, including `TO=0` for unlimited commands.
+readability, and `clear_env` is omitted when false. Live console banners and
+`--print`/`--attach` rendering always show `TO=<seconds>`, including `TO=0` for
+unlimited commands.
 
 ## Security notes
 

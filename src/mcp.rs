@@ -32,8 +32,10 @@ const HOST_NOT_FOUND: &str = "HOST NOT FOUND";
     name = "exec",
     description = "Run a command via the rexec host (fresh PTY, ANSI-stripped output). \
         Returns a JSON object with `exit`, `output`, and optional `error` fields. \
-        Provide `stdin` to feed the child a UTF-8 buffer; set `timeout` to a \
-        maximum runtime in seconds (zero disables it).",
+        Pass environment overrides in `env` (use `{}` when none are needed); \
+        `clear_env` clears the inherited environment first. Provide `stdin` to \
+        feed the child a UTF-8 buffer; set `timeout` to a maximum runtime in \
+        seconds (zero disables it).",
     read_only_hint = false,
     destructive_hint = true,
     idempotent_hint = false,
@@ -46,10 +48,12 @@ pub struct ExecTool {
     /// argv: `argv[0]` is the program (resolved via PATH), rest are arguments.
     /// Must be non-empty.
     pub argv: Vec<String>,
-    /// Extra environment variables, each as "VAR=VAL". Added to (not replacing)
-    /// the host's environment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub envs: Option<Vec<String>>,
+    /// Environment variable overrides. Pass an empty object when none are
+    /// needed. Names and values are forwarded without restriction.
+    pub env: BTreeMap<String, String>,
+    /// Clear the inherited environment before applying `env` overrides.
+    #[serde(default)]
+    pub clear_env: bool,
     /// Optional UTF-8 bytes to feed the child's stdin. When provided the host
     /// attaches a pipe to fd 0 and closes it after writing, so the child sees
     /// a real EOF rather than blocking on the PTY slave.
@@ -322,22 +326,11 @@ impl Handler {
                 "argv must be non-empty".to_string(),
             ));
         }
-        let mut envs = BTreeMap::new();
-        for entry in tool.envs.unwrap_or_default() {
-            let (k, v) = entry.split_once('=').ok_or_else(|| {
-                CallToolError::from_message(format!("envs entry must be VAR=value, got: {entry}"))
-            })?;
-            if k.is_empty() {
-                return Err(CallToolError::from_message(format!(
-                    "envs entry has empty name: {entry}"
-                )));
-            }
-            envs.insert(k.to_string(), v.to_string());
-        }
         let request = Request {
             whoami: self.whoami.clone(),
             dir: tool.dir,
-            envs,
+            envs: tool.env,
+            clear_env: tool.clear_env,
             exec: tool.argv,
             stdin: tool.stdin,
             timeout: tool.timeout,
@@ -602,6 +595,7 @@ mod tests {
             whoami: "test".into(),
             dir: "/tmp".into(),
             envs: BTreeMap::new(),
+            clear_env: false,
             exec: vec!["true".into()],
             stdin: None,
             timeout: 0,
@@ -612,16 +606,46 @@ mod tests {
     fn exec_timeout_defaults_to_zero() {
         let tool: ExecTool = serde_json::from_value(serde_json::json!({
             "dir": "/tmp",
-            "argv": ["true"]
+            "argv": ["true"],
+            "env": {}
         }))
         .unwrap();
         assert_eq!(tool.timeout, 0);
+        assert!(!tool.clear_env);
     }
 
     #[test]
-    fn exec_schema_exposes_timeout() {
+    fn exec_accepts_environment_object_and_clear_flag() {
+        let tool: ExecTool = serde_json::from_value(serde_json::json!({
+            "dir": "/tmp",
+            "argv": ["true"],
+            "env": {"PATH": "/custom/bin", "TOKEN": "content"},
+            "clear_env": true
+        }))
+        .unwrap();
+        assert_eq!(tool.env["PATH"], "/custom/bin");
+        assert_eq!(tool.env["TOKEN"], "content");
+        assert!(tool.clear_env);
+    }
+
+    #[test]
+    fn exec_requires_environment_object() {
+        assert!(
+            serde_json::from_value::<ExecTool>(serde_json::json!({
+                "dir": "/tmp",
+                "argv": ["true"]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_schema_exposes_environment_controls_and_timeout() {
         let tools = serde_json::to_value(RexecTools::tools()).unwrap();
-        assert!(tools.to_string().contains("\"timeout\""));
+        let tools = tools.to_string();
+        assert!(tools.contains("\"env\""));
+        assert!(tools.contains("\"clear_env\""));
+        assert!(tools.contains("\"timeout\""));
     }
 
     #[test]

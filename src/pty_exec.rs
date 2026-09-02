@@ -58,6 +58,7 @@ impl std::error::Error for SpawnError {}
 pub fn spawn(
     argv: &[String],
     envs: &[(String, String)],
+    clear_env: bool,
     cwd: &str,
     stdin_provided: bool,
 ) -> Result<Spawned, SpawnError> {
@@ -103,8 +104,8 @@ pub fn spawn(
     let termios = make_termios()?;
 
     // SAFETY: forkpty is called before this function spawns any threads in the parent. The child
-    // branch performs only async-signal-safe operations (chdir, setenv, dup2, write, _exit) plus
-    // execvp on prebuilt C strings, and _exits on any failure.
+    // branch performs only the existing environment/setup operations (chdir, clearenv, setenv,
+    // dup2, write, _exit) plus execvp on prebuilt C strings, and _exits on any failure.
     let result = unsafe { forkpty(Some(&winsize), Some(&termios)) }.map_err(SpawnError::Fork)?;
 
     match result {
@@ -130,6 +131,11 @@ pub fn spawn(
                     libc::_exit(127);
                 }
                 if libc::chdir(cwd_c.as_ptr()) != 0 {
+                    let errno = Errno::last() as i32;
+                    write_errno(write_raw, errno);
+                    libc::_exit(127);
+                }
+                if clear_env && libc::clearenv() != 0 {
                     let errno = Errno::last() as i32;
                     write_errno(write_raw, errno);
                     libc::_exit(127);

@@ -1,8 +1,10 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -157,7 +159,14 @@ pub fn run() -> std::io::Result<()> {
 }
 
 pub fn run_with_options(silent: bool) -> std::io::Result<()> {
+    run_with_path_options(silent, true)
+}
+
+pub fn run_with_path_options(silent: bool, add_path: bool) -> std::io::Result<()> {
     SHUTDOWN.store(false, Ordering::SeqCst);
+    if add_path {
+        add_user_bin_dirs_to_path();
+    }
     let path = socket::socket_path();
 
     let listener = bind_with_stale_takeover(&path)?;
@@ -246,6 +255,44 @@ pub fn run_with_options(silent: bool) -> std::io::Result<()> {
         eprintln!("rexec host: shutdown");
     }
     Ok(())
+}
+
+fn add_user_bin_dirs_to_path() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::env::var_os("PATH");
+    let Some(path) = augmented_path(&home, path.as_deref(), Path::is_dir) else {
+        return;
+    };
+
+    // SAFETY: host startup calls this before creating any worker threads.
+    unsafe {
+        std::env::set_var("PATH", path);
+    }
+}
+
+fn augmented_path(
+    home: &OsStr,
+    current: Option<&OsStr>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<OsString> {
+    let home = Path::new(home);
+    let candidates = [home.join(".local/bin"), home.join(".cargo/bin")];
+    let current: Vec<PathBuf> = current
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    let additions: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| is_dir(candidate) && !current.iter().any(|path| path == candidate))
+        .collect();
+    if additions.is_empty() {
+        return None;
+    }
+
+    std::env::join_paths(additions.into_iter().chain(current)).ok()
 }
 
 fn bind_with_stale_takeover(path: &std::path::Path) -> std::io::Result<UnixListener> {
@@ -420,6 +467,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
         let spawn_result = pty_exec::spawn(
             &request.exec,
             &envs_vec,
+            request.clear_env,
             &request.dir,
             request.stdin.is_some(),
         );
@@ -451,6 +499,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
                         whoami: request.whoami,
                         dir: request.dir,
                         envs: request.envs,
+                        clear_env: request.clear_env,
                         exec: request.exec,
                         timeout: request.timeout,
                         exit: 127,
@@ -592,6 +641,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
             whoami: request.whoami,
             dir: request.dir,
             envs: request.envs,
+            clear_env: request.clear_env,
             exec: request.exec,
             timeout: request.timeout,
             exit: exit_for_response,
@@ -908,10 +958,83 @@ mod tests {
             whoami: "test".into(),
             dir: "/tmp".into(),
             envs: BTreeMap::new(),
+            clear_env: false,
             exec: vec![command.into()],
             stdin: None,
             timeout: 0,
         }
+    }
+
+    #[test]
+    fn user_bin_dirs_are_prepended_in_order() {
+        let path = augmented_path(
+            OsStr::new("/home/test"),
+            Some(OsStr::new("/usr/bin:/bin")),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            OsStr::new("/home/test/.local/bin:/home/test/.cargo/bin:/usr/bin:/bin")
+        );
+    }
+
+    #[test]
+    fn only_existing_user_bin_dirs_are_added() {
+        let path = augmented_path(
+            OsStr::new("/home/test"),
+            Some(OsStr::new("/usr/bin")),
+            |candidate| candidate.ends_with(".local/bin"),
+        )
+        .unwrap();
+        assert_eq!(path, OsStr::new("/home/test/.local/bin:/usr/bin"));
+    }
+
+    #[test]
+    fn user_bin_dirs_are_not_added_twice() {
+        let path = augmented_path(
+            OsStr::new("/home/test"),
+            Some(OsStr::new(
+                "/home/test/.local/bin:/home/test/.cargo/bin:/usr/bin",
+            )),
+            |_| true,
+        );
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn clear_env_removes_inherited_values_before_overrides() {
+        let (host_end, client_end) = UnixStream::pair().unwrap();
+        let (state, transcript_path) = test_host_state();
+        let host = std::thread::spawn(move || handle_connection(host_end, state));
+        let mut connection =
+            client::HostConnection::from_stream_with_timeout(client_end, Duration::from_secs(1))
+                .unwrap();
+
+        let mut empty = test_request("/usr/bin/env");
+        empty.clear_env = true;
+        let response = connection.execute(&empty).unwrap();
+        assert_eq!(response.exit, 0);
+        assert!(response.output.is_empty());
+
+        let mut overridden = test_request("/bin/sh");
+        overridden.clear_env = true;
+        overridden.envs.insert("PATH".into(), "/custom/bin".into());
+        overridden.exec = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s|%s' \"${HOME-unset}\" \"$PATH\"".into(),
+        ];
+        let response = connection.execute(&overridden).unwrap();
+        assert_eq!(response.exit, 0);
+        assert_eq!(response.output, "unset|/custom/bin");
+
+        drop(connection);
+        host.join().unwrap();
+        let entries = crate::transcript::read_entries(&transcript_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.clear_env));
+        let _ = std::fs::remove_file(transcript_path);
     }
 
     #[test]

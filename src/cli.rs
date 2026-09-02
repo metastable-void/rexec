@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long = "silent", requires = "start_host")]
     pub silent: bool,
 
+    /// Do not add the user's local binary directories to the host PATH.
+    #[arg(long = "no-add-path", requires = "start_host")]
+    pub no_add_path: bool,
+
     /// List the N most recent transcripts (default: 10).
     #[arg(
         short = 'l',
@@ -73,8 +77,20 @@ pub struct Cli {
     pub dir: Option<PathBuf>,
 
     /// Environment overrides, in VAR=value form. Repeatable.
-    #[arg(long = "env", value_name = "VAR=VAL")]
+    #[arg(
+        short = 'e',
+        long = "env",
+        value_name = "VAR=VAL",
+        conflicts_with_all = ["check_host", "start_host", "list", "print", "attach", "install", "mcp_stdio"]
+    )]
     pub env: Vec<String>,
+
+    /// Clear the inherited environment before applying --env overrides.
+    #[arg(
+        long = "clear-env",
+        conflicts_with_all = ["check_host", "start_host", "list", "print", "attach", "install", "mcp_stdio"]
+    )]
+    pub clear_env: bool,
 
     /// Read the client's stdin to EOF and send it to the host to be fed to the
     /// child's stdin. Without this flag the child's stdin is /dev/null.
@@ -96,7 +112,7 @@ pub struct Cli {
 pub enum Mode {
     Help,
     CheckHost,
-    StartHost { silent: bool },
+    StartHost { silent: bool, add_path: bool },
     List(usize),
     Print { name: String, follow: bool },
     Attach { color: ColorChoice },
@@ -117,6 +133,7 @@ pub struct RunArgs {
     pub whoami: String,
     pub dir: PathBuf,
     pub envs: Vec<(String, String)>,
+    pub clear_env: bool,
     pub argv: Vec<String>,
     pub read_stdin: bool,
     pub timeout: u64,
@@ -132,7 +149,10 @@ fn dispatch(cli: Cli) -> Result<Mode, String> {
         return Ok(Mode::CheckHost);
     }
     if cli.start_host {
-        return Ok(Mode::StartHost { silent: cli.silent });
+        return Ok(Mode::StartHost {
+            silent: cli.silent,
+            add_path: !cli.no_add_path,
+        });
     }
     if let Some(limit) = cli.list {
         return Ok(Mode::List(limit.unwrap_or(10)));
@@ -192,6 +212,7 @@ fn dispatch(cli: Cli) -> Result<Mode, String> {
         whoami,
         dir,
         envs,
+        clear_env: cli.clear_env,
         argv: cli.args,
         read_stdin: cli.read_stdin,
         timeout: cli.timeout,
@@ -233,6 +254,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_repeatable_environment_overrides() {
+        let cli = Cli::try_parse_from([
+            "rexec",
+            "--whoami",
+            "test",
+            "--dir",
+            "/tmp",
+            "-e",
+            "PATH=/custom/bin",
+            "--env",
+            "TOKEN=content=with=equals",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Mode::Run(args) = dispatch(cli).unwrap() else {
+            panic!("expected run mode");
+        };
+        assert_eq!(
+            args.envs,
+            [
+                ("PATH".into(), "/custom/bin".into()),
+                ("TOKEN".into(), "content=with=equals".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_clear_environment() {
+        let cli = Cli::try_parse_from([
+            "rexec",
+            "--whoami",
+            "test",
+            "--dir",
+            "/tmp",
+            "--clear-env",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Mode::Run(args) = dispatch(cli).unwrap() else {
+            panic!("expected run mode");
+        };
+        assert!(args.clear_env);
+        assert!(args.envs.is_empty());
+    }
+
+    #[test]
     fn list_defaults_to_ten() {
         let cli = Cli::try_parse_from(["rexec", "--list"]).unwrap();
         assert!(matches!(dispatch(cli).unwrap(), Mode::List(10)));
@@ -255,7 +324,10 @@ mod tests {
         let cli = Cli::try_parse_from(["rexec", "-s"]).unwrap();
         assert!(matches!(
             dispatch(cli).unwrap(),
-            Mode::StartHost { silent: false }
+            Mode::StartHost {
+                silent: false,
+                add_path: true
+            }
         ));
     }
 
@@ -264,7 +336,22 @@ mod tests {
         let cli = Cli::try_parse_from(["rexec", "--start-host", "--silent"]).unwrap();
         assert!(matches!(
             dispatch(cli).unwrap(),
-            Mode::StartHost { silent: true }
+            Mode::StartHost {
+                silent: true,
+                add_path: true
+            }
+        ));
+    }
+
+    #[test]
+    fn host_path_addition_can_be_disabled() {
+        let cli = Cli::try_parse_from(["rexec", "--start-host", "--no-add-path"]).unwrap();
+        assert!(matches!(
+            dispatch(cli).unwrap(),
+            Mode::StartHost {
+                silent: false,
+                add_path: false
+            }
         ));
     }
 

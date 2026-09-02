@@ -15,7 +15,8 @@ fn main() -> ExitCode {
     let code = match mode {
         Mode::Help => 0,
         Mode::CheckHost => client::check_host(),
-        Mode::StartHost { silent } => match host::run_with_options(silent) {
+        Mode::StartHost { silent, add_path } => match host::run_with_path_options(silent, add_path)
+        {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("rexec: host: {err}");

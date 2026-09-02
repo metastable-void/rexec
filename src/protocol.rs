@@ -8,6 +8,9 @@ pub struct Request {
     pub dir: String,
     #[serde(default)]
     pub envs: BTreeMap<String, String>,
+    /// Clear the host's inherited environment before applying `envs`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_env: bool,
     pub exec: Vec<String>,
     /// Bytes to feed to the child's stdin. When present, the host attaches a
     /// pipe to the child's fd 0, writes these bytes, then closes the pipe so
@@ -33,6 +36,8 @@ pub struct TranscriptEntry {
     pub dir: String,
     #[serde(default)]
     pub envs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_env: bool,
     pub exec: Vec<String>,
     /// Requested maximum runtime in seconds. Zero means no timeout.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -51,6 +56,10 @@ pub const ERROR_TIMEOUT: &str = "timeout";
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Control messages from client to host. Encoded as JSONL with the `"action"`
@@ -102,6 +111,7 @@ mod tests {
         let request: Request =
             serde_json::from_str(r#"{"whoami":"test","dir":"/tmp","exec":["true"]}"#).unwrap();
         assert_eq!(request.timeout, 0);
+        assert!(!request.clear_env);
     }
 
     #[test]
@@ -110,12 +120,14 @@ mod tests {
             whoami: "test".into(),
             dir: "/tmp".into(),
             envs: BTreeMap::new(),
+            clear_env: false,
             exec: vec!["true".into()],
             stdin: None,
             timeout: 0,
         };
         let value = serde_json::to_value(request).unwrap();
         assert!(value.get("timeout").is_none());
+        assert!(value.get("clear_env").is_none());
     }
 
     #[test]
