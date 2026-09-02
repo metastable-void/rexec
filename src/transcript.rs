@@ -6,8 +6,7 @@ use std::sync::Mutex;
 use crate::protocol::TranscriptEntry;
 
 pub fn dir() -> std::io::Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| std::io::Error::other("HOME not set"))?;
     let path = PathBuf::from(home).join(".rexec");
     std::fs::create_dir_all(&path)?;
     Ok(path)
@@ -26,10 +25,14 @@ pub struct TranscriptWriter {
 impl TranscriptWriter {
     pub fn create(name: &str) -> std::io::Result<Self> {
         let path = path_for(name)?;
+        Self::create_at(&path)
+    }
+
+    pub(crate) fn create_at(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
-            .open(&path)?;
+            .open(path)?;
         Ok(Self {
             file: Mutex::new(BufWriter::new(file)),
         })

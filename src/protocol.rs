@@ -56,10 +56,12 @@ fn is_zero(value: &u64) -> bool {
 /// Control messages from client to host. Encoded as JSONL with the `"action"`
 /// field as the discriminator.
 ///
-/// `Ping` may appear as the first message on a fresh connection (instead of a
-/// `Request`); the host replies with a `ControlResponse::Pong` and closes.
-/// `Abort` may appear at any point after a `Request` and asks the host to
-/// terminate the corresponding child.
+/// `Ping` is required as the first message on every connection. The host
+/// replies with `ControlResponse::Pong` and keeps the verified connection open.
+/// A connection may then carry multiple sequential `Request`/`Response`
+/// exchanges. Each `Request` is itself immediately preceded by another
+/// `Ping`/`Pong` health check. `Abort` may appear while a request is running and
+/// asks the host to terminate the corresponding child.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum ClientAction {

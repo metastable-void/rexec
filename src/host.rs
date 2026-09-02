@@ -15,6 +15,7 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 
+use crate::client;
 use crate::filter::OutputFilter;
 use crate::protocol::{
     ClientAction, ControlResponse, ERROR_ABORTED, ERROR_NOT_FOUND, ERROR_TIMEOUT, HostEvent,
@@ -251,10 +252,19 @@ fn bind_with_stale_takeover(path: &std::path::Path) -> std::io::Result<UnixListe
     match UnixListener::bind(path) {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => match UnixStream::connect(path) {
-            Ok(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                "another rexec host is already running",
-            )),
+            Ok(stream) => {
+                let verified = client::HostConnection::from_stream_with_timeout(
+                    stream,
+                    Duration::from_secs(2),
+                )
+                .is_ok();
+                let message = if verified {
+                    "another rexec host is already running"
+                } else {
+                    "another listener owns the rexec socket but did not confirm pong"
+                };
+                Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message))
+            }
             Err(_) => {
                 std::fs::remove_file(path)?;
                 UnixListener::bind(path)
@@ -315,226 +325,282 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
     }
     let _ = reader.get_ref().set_read_timeout(None);
 
-    let trimmed = line.trim_end();
-
-    // The first line is either a control action (ping / stray abort) or a
-    // command Request. Try the tagged enum first; on failure fall through to
-    // Request parsing.
-    if let Ok(action) = serde_json::from_str::<ClientAction>(trimmed) {
-        match action {
-            ClientAction::Ping => {
-                let _ = write_control_response(&write_stream, &ControlResponse::Pong);
+    // Every client connection starts with a ping/pong handshake. Unlike the
+    // old one-shot ping, the host keeps the verified socket open for commands.
+    match serde_json::from_str::<ClientAction>(line.trim_end()) {
+        Ok(ClientAction::Ping) => {
+            if write_control_response(&write_stream, &ControlResponse::Pong).is_err() {
+                return;
             }
-            ClientAction::Abort => {
-                // No run in progress to abort; just close.
-            }
-            ClientAction::Attach { ansi } => serve_attachment(write_stream, &host, ansi),
         }
-        return;
+        _ => {
+            eprintln!("rexec host: connection did not start with ping");
+            return;
+        }
     }
 
-    let request: Request = match serde_json::from_str(trimmed) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("rexec host: malformed request: {err}");
+    let mut command_pinged = false;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("rexec host: read request: {err}");
+                return;
+            }
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(action) = serde_json::from_str::<ClientAction>(trimmed) {
+            match action {
+                ClientAction::Ping => {
+                    if write_control_response(&write_stream, &ControlResponse::Pong).is_err() {
+                        return;
+                    }
+                    command_pinged = true;
+                }
+                ClientAction::Abort => {
+                    // No command is active, so there is nothing to abort.
+                }
+                ClientAction::Attach { ansi } => {
+                    serve_attachment(write_stream, &host, ansi);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        if !command_pinged {
+            eprintln!("rexec host: command request was not preceded by ping");
+            return;
+        }
+        command_pinged = false;
+
+        let request: Request = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("rexec host: malformed request: {err}");
+                let resp = Response {
+                    exit: 127,
+                    output: String::new(),
+                    error: Some(format!("malformed request: {err}")),
+                };
+                if write_response(&write_stream, &resp).is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        if request.exec.is_empty() {
             let resp = Response {
                 exit: 127,
                 output: String::new(),
-                error: Some(format!("malformed request: {err}")),
+                error: Some("exec is empty".into()),
             };
-            let _ = write_response(&write_stream, &resp);
-            return;
+            if write_response(&write_stream, &resp).is_err() {
+                return;
+            }
+            continue;
         }
-    };
 
-    if request.exec.is_empty() {
-        let resp = Response {
-            exit: 127,
-            output: String::new(),
-            error: Some("exec is empty".into()),
-        };
-        let _ = write_response(&write_stream, &resp);
-        return;
-    }
+        let seq = host.next_seq.fetch_add(1, Ordering::SeqCst);
+        let request_time = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let seq = host.next_seq.fetch_add(1, Ordering::SeqCst);
-    let request_time = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let envs_vec: Vec<(String, String)> = request
+            .envs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
-    let envs_vec: Vec<(String, String)> = request
-        .envs
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+        let spawn_result = pty_exec::spawn(
+            &request.exec,
+            &envs_vec,
+            &request.dir,
+            request.stdin.is_some(),
+        );
 
-    let spawn_result = pty_exec::spawn(
-        &request.exec,
-        &envs_vec,
-        &request.dir,
-        request.stdin.is_some(),
-    );
+        let spawned = match spawn_result {
+            Ok(s) => s,
+            Err(err) => {
+                let _ = queue_console_output(
+                    host.print_queue.clone(),
+                    seq,
+                    request.clone(),
+                    request_time.clone(),
+                    None,
+                    host.silent,
+                );
 
-    let spawned = match spawn_result {
-        Ok(s) => s,
-        Err(err) => {
-            let _ = queue_console_output(
-                host.print_queue.clone(),
-                seq,
-                request.clone(),
-                request_time.clone(),
-                None,
-                host.silent,
-            );
-
-            let msg = format!("rexec: failed to spawn command: {err}\n");
-            let resp = Response {
-                exit: 127,
-                output: msg.clone(),
-                error: Some("spawn_failed".into()),
-            };
-            let _ = write_response(&write_stream, &resp);
-            host.transcript.submit(
-                seq,
-                TranscriptEntry {
-                    whoami: request.whoami,
-                    dir: request.dir,
-                    envs: request.envs,
-                    exec: request.exec,
-                    timeout: request.timeout,
+                let msg = format!("rexec: failed to spawn command: {err}\n");
+                let resp = Response {
                     exit: 127,
                     output: msg.clone(),
                     error: Some("spawn_failed".into()),
-                    time: Some(request_time),
-                },
-                msg,
-            );
-            return;
-        }
-    };
-
-    let pty_exec::Spawned {
-        master,
-        child,
-        errno_pipe_read,
-        stdin_write,
-    } = spawned;
-
-    // Feed the child's stdin in the background. The thread closes the pipe on
-    // drop, sending EOF; an unread tail just produces EPIPE which we ignore.
-    if let Some(stdin_fd) = stdin_write {
-        let bytes = request.stdin.clone().unwrap_or_default().into_bytes();
-        std::thread::spawn(move || {
-            let mut file = std::fs::File::from(stdin_fd);
-            let _ = file.write_all(&bytes);
-        });
-    }
-
-    let buf = Arc::new((
-        Mutex::new(PtyBuffer {
-            raw_pending: Vec::new(),
-            raw_total: Vec::new(),
-            filtered_total: Vec::new(),
-            eof: false,
-            console_output: !host.silent,
-        }),
-        Condvar::new(),
-    ));
-
-    let reader_buf = buf.clone();
-    let reader_handle = std::thread::spawn(move || pty_reader(master, reader_buf));
-
-    // Start the timeout as soon as the process is running, rather than when it
-    // reaches the front of the console print queue. The child is a session and
-    // process-group leader, so killing its group also catches pager descendants.
-    let timeout_thread = if request.timeout == 0 {
-        None
-    } else {
-        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-        let timeout = Duration::from_secs(request.timeout);
-        let handle = std::thread::spawn(move || {
-            if timeout_expired(&cancel_rx, timeout) {
-                kill_child_group(child);
-                true
-            } else {
-                false
+                };
+                if write_response(&write_stream, &resp).is_err() {
+                    return;
+                }
+                host.transcript.submit(
+                    seq,
+                    TranscriptEntry {
+                        whoami: request.whoami,
+                        dir: request.dir,
+                        envs: request.envs,
+                        exec: request.exec,
+                        timeout: request.timeout,
+                        exit: 127,
+                        output: msg.clone(),
+                        error: Some("spawn_failed".into()),
+                        time: Some(request_time),
+                    },
+                    msg,
+                );
+                continue;
             }
-        });
-        Some((cancel_tx, handle))
-    };
+        };
 
-    // Watch for an explicit `{"action":"abort"}` line (or client EOF) and kill
-    // the child's process group if the client bails before we send a response.
-    let abort_thread = std::thread::spawn(move || abort_watcher(reader, child));
+        let pty_exec::Spawned {
+            master,
+            child,
+            errno_pipe_read,
+            stdin_write,
+        } = spawned;
 
-    // Console output remains ordered by request arrival, but printing happens
-    // independently of this connection worker. A command that finishes while
-    // an earlier command owns the console can therefore return immediately to
-    // its CLI or MCP caller.
-    let _ = queue_console_output(
-        host.print_queue.clone(),
-        seq,
-        request.clone(),
-        request_time.clone(),
-        Some(buf.clone()),
-        host.silent,
-    );
+        // Feed the child's stdin in the background. The thread closes the pipe on
+        // drop, sending EOF; an unread tail just produces EPIPE which we ignore.
+        if let Some(stdin_fd) = stdin_write {
+            let bytes = request.stdin.clone().unwrap_or_default().into_bytes();
+            std::thread::spawn(move || {
+                let mut file = std::fs::File::from(stdin_fd);
+                let _ = file.write_all(&bytes);
+            });
+        }
 
-    let _ = reader_handle.join();
+        let buf = Arc::new((
+            Mutex::new(PtyBuffer {
+                raw_pending: Vec::new(),
+                raw_total: Vec::new(),
+                filtered_total: Vec::new(),
+                eof: false,
+                console_output: !host.silent,
+            }),
+            Condvar::new(),
+        ));
 
-    let timed_out = if let Some((cancel, handle)) = timeout_thread {
-        let _ = cancel.send(());
-        handle.join().unwrap_or(false)
-    } else {
-        false
-    };
+        let reader_buf = buf.clone();
+        let reader_handle = std::thread::spawn(move || pty_reader(master, reader_buf));
 
-    // Wake the abort watcher (locally close the read side) and join it BEFORE
-    // waitpid so it cannot race with PID reuse.
-    let _ = write_stream.shutdown(std::net::Shutdown::Read);
-    let aborted = abort_thread.join().unwrap_or(false);
+        // Start the timeout as soon as the process is running, rather than when it
+        // reaches the front of the console print queue. The child is a session and
+        // process-group leader, so killing its group also catches pager descendants.
+        let timeout_thread = if request.timeout == 0 {
+            None
+        } else {
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            let timeout = Duration::from_secs(request.timeout);
+            let handle = std::thread::spawn(move || {
+                if timeout_expired(&cancel_rx, timeout) {
+                    kill_child_group(child);
+                    true
+                } else {
+                    false
+                }
+            });
+            Some((cancel_tx, handle))
+        };
 
-    let exit_code = wait_for_child(child);
-    let errno = pty_exec::read_errno(&errno_pipe_read).unwrap_or(None);
+        // Watch for an explicit `{"action":"abort"}` line (or client EOF). A
+        // short socket timeout lets the watcher return the buffered reader after
+        // the command, so this connection can parse the next request.
+        let command_finished = Arc::new(AtomicBool::new(false));
+        let watcher_finished = command_finished.clone();
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)));
+        let abort_thread =
+            std::thread::spawn(move || abort_watcher(reader, child, watcher_finished));
 
-    let (response_error, exit_for_response) = if errno.is_some() {
-        (Some(ERROR_NOT_FOUND.to_string()), 127)
-    } else if timed_out {
-        (Some(ERROR_TIMEOUT.to_string()), 124)
-    } else if aborted {
-        (Some(ERROR_ABORTED.to_string()), exit_code)
-    } else {
-        (None, exit_code)
-    };
+        // Console output remains ordered by request arrival, but printing happens
+        // independently of this connection worker. A command that finishes while
+        // an earlier command owns the console can therefore return immediately to
+        // its CLI or MCP caller.
+        let _ = queue_console_output(
+            host.print_queue.clone(),
+            seq,
+            request.clone(),
+            request_time.clone(),
+            Some(buf.clone()),
+            host.silent,
+        );
 
-    let filtered_output = {
-        let (lock, _) = &*buf;
-        let g = lock.lock().unwrap();
-        String::from_utf8_lossy(&g.filtered_total).into_owned()
-    };
-    let raw_output = {
-        let (lock, _) = &*buf;
-        let g = lock.lock().unwrap();
-        String::from_utf8_lossy(&g.raw_total).into_owned()
-    };
+        let _ = reader_handle.join();
+        command_finished.store(true, Ordering::SeqCst);
 
-    let response = Response {
-        exit: exit_for_response,
-        output: filtered_output.clone(),
-        error: response_error.clone(),
-    };
-    let _ = write_response(&write_stream, &response);
+        let timed_out = if let Some((cancel, handle)) = timeout_thread {
+            let _ = cancel.send(());
+            handle.join().unwrap_or(false)
+        } else {
+            false
+        };
 
-    let entry = TranscriptEntry {
-        whoami: request.whoami,
-        dir: request.dir,
-        envs: request.envs,
-        exec: request.exec,
-        timeout: request.timeout,
-        exit: exit_for_response,
-        output: filtered_output,
-        error: response_error,
-        time: Some(request_time),
-    };
-    host.transcript.submit(seq, entry, raw_output);
+        // Join the abort watcher BEFORE waitpid so it cannot race with PID reuse,
+        // then restore blocking reads for the next request on this connection.
+        let (returned_reader, aborted) = match abort_thread.join() {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+        reader = returned_reader;
+        let _ = reader.get_ref().set_read_timeout(None);
+
+        let exit_code = wait_for_child(child);
+        let errno = pty_exec::read_errno(&errno_pipe_read).unwrap_or(None);
+
+        let (response_error, exit_for_response) = if errno.is_some() {
+            (Some(ERROR_NOT_FOUND.to_string()), 127)
+        } else if timed_out {
+            (Some(ERROR_TIMEOUT.to_string()), 124)
+        } else if aborted {
+            (Some(ERROR_ABORTED.to_string()), exit_code)
+        } else {
+            (None, exit_code)
+        };
+
+        let filtered_output = {
+            let (lock, _) = &*buf;
+            let g = lock.lock().unwrap();
+            String::from_utf8_lossy(&g.filtered_total).into_owned()
+        };
+        let raw_output = {
+            let (lock, _) = &*buf;
+            let g = lock.lock().unwrap();
+            String::from_utf8_lossy(&g.raw_total).into_owned()
+        };
+
+        let response = Response {
+            exit: exit_for_response,
+            output: filtered_output.clone(),
+            error: response_error.clone(),
+        };
+        let _ = write_response(&write_stream, &response);
+
+        let entry = TranscriptEntry {
+            whoami: request.whoami,
+            dir: request.dir,
+            envs: request.envs,
+            exec: request.exec,
+            timeout: request.timeout,
+            exit: exit_for_response,
+            output: filtered_output,
+            error: response_error,
+            time: Some(request_time),
+        };
+        host.transcript.submit(seq, entry, raw_output);
+    }
 }
 
 fn timeout_expired(cancel: &Receiver<()>, timeout: Duration) -> bool {
@@ -582,12 +648,22 @@ where
 // true if an abort was honoured (or the client disconnected while the child was
 // still running). Sends SIGTERM, then SIGKILL after a short grace, to the
 // child's process group (forkpty makes the child a session/PG leader).
-fn abort_watcher(mut reader: BufReader<UnixStream>, child: Pid) -> bool {
+fn abort_watcher(
+    mut reader: BufReader<UnixStream>,
+    child: Pid,
+    command_finished: Arc<AtomicBool>,
+) -> (BufReader<UnixStream>, bool) {
     let mut line = String::new();
     loop {
+        if command_finished.load(Ordering::SeqCst) {
+            return (reader, false);
+        }
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => return false,
+            Ok(0) => {
+                kill_child_group(child);
+                return (reader, true);
+            }
             Ok(_) => {
                 let trimmed = line.trim_end();
                 if trimmed.is_empty() {
@@ -596,7 +672,7 @@ fn abort_watcher(mut reader: BufReader<UnixStream>, child: Pid) -> bool {
                 match serde_json::from_str::<ClientAction>(trimmed) {
                     Ok(ClientAction::Abort) => {
                         kill_child_group(child);
-                        return true;
+                        return (reader, true);
                     }
                     // A stray ping mid-run is meaningless; ignore it rather
                     // than treat it as a connection break.
@@ -604,7 +680,15 @@ fn abort_watcher(mut reader: BufReader<UnixStream>, child: Pid) -> bool {
                     Err(_) => continue,
                 }
             }
-            Err(_) => return false,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => {
+                kill_child_group(child);
+                return (reader, true);
+            }
         }
     }
 }
@@ -686,6 +770,8 @@ fn print_banner(req: &Request, ts: &str) {
     s.push(':');
     s.push_str(&req.dir);
     s.push_str(" $");
+    s.push_str(" TO=");
+    s.push_str(&req.timeout.to_string());
     for arg in &req.exec {
         s.push(' ');
         s.push_str(&shell_quote(arg));
@@ -732,8 +818,6 @@ fn write_response(stream: &UnixStream, response: &Response) -> std::io::Result<(
     s.write_all(body.as_bytes())?;
     s.write_all(b"\n")?;
     s.flush()?;
-    use std::net::Shutdown;
-    let _ = stream.shutdown(Shutdown::Write);
     Ok(())
 }
 
@@ -744,7 +828,6 @@ fn write_control_response(stream: &UnixStream, response: &ControlResponse) -> st
     s.write_all(body.as_bytes())?;
     s.write_all(b"\n")?;
     s.flush()?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 
@@ -798,6 +881,38 @@ fn attachment_disconnected(stream: &UnixStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_TRANSCRIPT: AtomicU64 = AtomicU64::new(0);
+
+    fn test_host_state() -> (Arc<HostState>, std::path::PathBuf) {
+        let sequence = NEXT_TRANSCRIPT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rexec-host-test-{}-{sequence}.jsonl",
+            std::process::id()
+        ));
+        let transcript = TranscriptWriter::create_at(&path).unwrap();
+        (
+            Arc::new(HostState {
+                next_seq: AtomicU64::new(0),
+                print_queue: Arc::new(PrintQueue::new()),
+                transcript: TranscriptQueue::new(transcript),
+                silent: true,
+            }),
+            path,
+        )
+    }
+
+    fn test_request(command: &str) -> Request {
+        Request {
+            whoami: "test".into(),
+            dir: "/tmp".into(),
+            envs: BTreeMap::new(),
+            exec: vec![command.into()],
+            stdin: None,
+            timeout: 0,
+        }
+    }
 
     #[test]
     fn timeout_wait_can_be_cancelled() {
@@ -847,5 +962,48 @@ mod tests {
         assert!(!attachment_disconnected(&host_end));
         drop(client_end);
         assert!(attachment_disconnected(&host_end));
+    }
+
+    #[test]
+    fn verified_connection_accepts_multiple_commands() {
+        let (host_end, client_end) = UnixStream::pair().unwrap();
+        let (state, transcript_path) = test_host_state();
+        let host = std::thread::spawn(move || handle_connection(host_end, state));
+        let mut connection =
+            client::HostConnection::from_stream_with_timeout(client_end, Duration::from_secs(1))
+                .unwrap();
+
+        let first = connection.execute(&test_request("true")).unwrap();
+        let second = connection.execute(&test_request("true")).unwrap();
+        assert_eq!(first.exit, 0);
+        assert_eq!(second.exit, 0);
+
+        drop(connection);
+        host.join().unwrap();
+        let entries = crate::transcript::read_entries(&transcript_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        let _ = std::fs::remove_file(transcript_path);
+    }
+
+    #[test]
+    fn command_without_fresh_ping_is_rejected() {
+        let (host_end, client_end) = UnixStream::pair().unwrap();
+        let (state, transcript_path) = test_host_state();
+        let host = std::thread::spawn(move || handle_connection(host_end, state));
+        let mut connection =
+            client::HostConnection::from_stream_with_timeout(client_end, Duration::from_secs(1))
+                .unwrap();
+
+        assert!(
+            connection
+                .execute_after_ping(&test_request("true"))
+                .is_err()
+        );
+
+        drop(connection);
+        host.join().unwrap();
+        let entries = crate::transcript::read_entries(&transcript_path).unwrap();
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_file(transcript_path);
     }
 }

@@ -24,13 +24,19 @@ after the fact.
   and any TTY behaviour.
 - **Fresh PTY per command.** Each command runs as if from a small (80x24)
   terminal with sane termios.
+- **Verified, reusable connections.** Every client connection begins with a
+  required ping/pong handshake, every command is immediately preceded by a
+  fresh ping/pong, and each socket can carry multiple sequential commands.
+- **Resilient concurrent MCP.** The stdio server pools verified connections,
+  runs overlapping tool calls concurrently, and reconnects forever after host
+  outages without placing its connection deadline on command execution.
 - **JSONL transcripts.** Every run is appended to
   `~/.rexec/YYYY-MM-DD-HH:MM:SS.jsonl` and can be listed, printed, or
   followed live.
-- **Cooperative abort.** Clients send `{"action":"abort"}` automatically on
-  any catchable termination (Ctrl-C, SIGTERM, panic, dropped connection);
-  the host SIGTERMs the spawned process group then SIGKILLs after a brief
-  grace.
+- **Cooperative abort.** The CLI sends `{"action":"abort"}` on catchable
+  termination (Ctrl-C, SIGTERM, panic, or a dropped request guard); an actual
+  socket disconnect is detected as EOF. The host SIGTERMs the spawned process
+  group then SIGKILLs after a brief grace.
 - **Optional user service.** `rexec --install` installs and starts a per-user
   systemd service. The host can still run directly as `rexec --start-host`;
   ^C cleans it up. Single static binary, no Python in the build graph, builds
@@ -53,6 +59,22 @@ cargo install --path .
 ```
 
 Unix only. Tested on Linux (glibc and musl). BSDs and macOS should work.
+
+### Upgrading to 0.5
+
+Version 0.5 makes the ping/pong handshake mandatory and keeps verified sockets
+open for multiple commands. The wire protocol is therefore not compatible with
+0.4 clients or hosts. Upgrade both ends together and restart any running host;
+after installing a new binary with `rexec --install`, restart the user service
+so it is not still serving the old protocol.
+
+```bash
+rexec --install
+systemctl --user restart rexec.service
+```
+
+For a directly started foreground host, stop the old process and launch
+`rexec --start-host` again before using a 0.5 client.
 
 ## Quick start
 
@@ -86,7 +108,8 @@ rexec --whoami "Claude Code" --dir "$PWD" -- grep -v foo bar.txt
 
 The host prints a banner and the command's raw output to its own console;
 the client receives the ANSI-stripped output on stdout and exits with the
-command's exit code.
+command's exit code. The banner includes `TO=0` for unlimited execution or
+`TO=<seconds>` for a requested command timeout.
 
 ## CLI
 
@@ -120,6 +143,8 @@ rexec --whoami Codex --dir /path/to/repo --env RUST_LOG=debug -- cargo test --wo
 
 `argv[0]` is resolved via `PATH` (`execvp` semantics). Output to stdout is
 the command's combined stdout+stderr, ANSI-stripped, CR-normalised. The
+live and replayed transcript command line includes `TO=<seconds>` for the
+requested command timeout; `TO=0` denotes unlimited execution. The
 client's exit code is:
 
 | Code  | Meaning |
@@ -137,6 +162,8 @@ rexec --check-host
 ```
 
 Prints `HOST RUNNING` (exit 0) or `HOST NOT FOUND` (exit 127).
+The check succeeds only after the host returns a valid pong; merely connecting
+to a process that owns the socket is not considered a healthy host.
 
 ### Start the host
 
@@ -209,20 +236,46 @@ rexec --mcp-stdio --whoami "Claude Code"
 ```
 
 Speaks the Model Context Protocol (MCP) over stdio. The agent launches `rexec
---mcp-stdio --whoami <NAME>` as a subprocess; each tool call becomes a fresh
-client connection to the rexec host, identical to invoking `rexec --whoami ...`
-on the command line. `--whoami` is fixed for the session.
+--mcp-stdio --whoami <NAME>` as a subprocess. The stdio server maintains a pool
+of ping/pong-verified host connections and reuses idle connections for later
+tool calls. When no verified connection is available and no command owns one,
+the background reconnect loop retries forever with one-second intervals. Idle
+pooled sockets are checked for disconnects once per second. `--whoami` is fixed
+for the session.
+
+Each MCP tool call waits at most 15 seconds to acquire a verified connection if
+the host is unavailable. If the host has not returned, `exec` reports `HOST NOT
+FOUND` as an MCP error and `check_host` returns `HOST NOT FOUND`; the background
+loop continues retrying after that individual call finishes. The 15-second
+connection deadline ends as soon as a connection is acquired. It never limits
+the command itself: execution is unlimited when the tool's `timeout` is `0`, or
+is limited only by that requested command timeout.
+
+Immediately before sending each command request, the client sends another ping
+and requires pong. A failed pre-command ping invalidates that pooled socket and
+is safely retried within the same connection window because no command request
+has yet been sent. Once a request is sent, it is never replayed automatically.
+Every tool call can also establish a connection itself, so recovery does not
+depend solely on the background worker and a worker delay cannot permanently
+strand a live stdio MCP process.
+
+Overlapping MCP `exec` calls run concurrently. Idle verified connections are
+reused; when all pooled connections are executing, the server opens another
+ping/pong-verified connection instead of waiting for an unrelated command.
+Socket I/O runs on Tokio's blocking pool, so a long command does not block the
+stdio transport. Active connections are never probed, timed out, or replaced
+by the reconnect loop merely because their commands take a long time.
 
 Two tools are exposed:
 
 | Tool         | Purpose |
 |--------------|---------|
 | `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `envs` (array of `"VAR=VAL"` strings, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
-| `check_host` | Probes the per-user host. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
+| `check_host` | Acquires a ping/pong-verified pooled connection, waiting up to 15 seconds if the host is unavailable. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
 
 The MCP server itself does no work other than forwarding — a host started
-directly or through the user service must be running for `exec` calls to
-succeed.
+directly or through the user service must be running (or return within the
+15-second connection window) for `exec` calls to succeed.
 
 Configuration example (Claude Code's `mcp_servers` block, similar shape for
 other MCP clients):
@@ -241,8 +294,10 @@ other MCP clients):
 ## Architecture
 
 The host owns a Unix domain socket at `/tmp/.rexec-$UID` (mode `0600`, owner
-only). Clients open a fresh connection per command — there is no persistent
-client state.
+only). Every client connection begins with a required ping/pong handshake and
+may carry multiple sequential commands. One-shot CLI invocations close their
+verified connection after one operation; the stdio MCP server keeps and reuses
+its pooled connections until either side disconnects.
 
 ```
 +----------------+              +---------------------------+              +---------------+
@@ -260,6 +315,11 @@ client state.
   output. If the console is occupied, later raw output is buffered; command
   completion and the CLI/MCP response do not wait for that printing turn, so
   a slow command never blocks a fast one from completing on the client side.
+- **Connections.** A per-connection host worker requires ping/pong first and
+  then processes command requests sequentially until EOF, requiring another
+  ping/pong immediately before each request. Concurrency uses multiple
+  connections. The MCP server retains idle verified connections in a pool and
+  creates another when all pooled connections are active.
 - **PTY.** Each command runs under a fresh 80x24 PTY with sane termios
   (B38400, `CS8`, no input/output processing). This gives realistic TTY
   behaviour for tools that detect a terminal, without leaking the host's
@@ -279,23 +339,51 @@ client state.
 
 ## Protocol
 
-The client opens a fresh socket per command and exchanges JSONL — one JSON
-object per line — with the host.
+Clients and the host exchange JSONL: one JSON object per line. A connection has
+the following lifecycle:
 
-The first line of every connection is one of:
+1. The client sends **Ping** as the mandatory first line.
+2. The host confirms **Pong** and keeps the connection open.
+3. The verified connection either carries sequential **Ping → Pong → Request →
+   Response** command exchanges, or switches to the long-lived **Attach** event
+   stream.
+4. While a request is active, the client may send **Abort**. The next request
+   must not be sent until the current response arrives; command pipelining on a
+   single connection is not supported. Use separate connections for concurrent
+   commands, as the MCP pool does.
 
-- a **Request** (run a command — no `"action"` field), or
-- a **Ping** action (`{"action":"ping"}`), to which the host replies
-  `{"result":"pong"}` and closes. This is what `--check-host` sends, or
-- an **Attach** action (`{"action":"attach","ansi":true}`), after which the
-  host sends transcript events until it exits or the client disconnects.
+If ping is missing, pong is invalid or absent, or either side disconnects, the
+individual connection is discarded. This does not require restarting an MCP
+session: each later tool call can establish and verify a replacement even if
+the background reconnect worker is unavailable. The CLI closes its verified
+connection after its one operation. MCP retains healthy idle connections for
+subsequent tool calls. The host rejects any Request that was not immediately
+authorized by a fresh ping/pong exchange.
 
-After a Request, the client may send further JSONL action lines (currently
-only **Abort**) on the same connection.
+### 1. Ping / Pong handshake (client ↔ host)
 
-### 1. Request (client → host)
+Every connection begins with:
 
-The first line is the request:
+```json
+{"action":"ping"}
+```
+
+The host must reply:
+
+```json
+{"result":"pong"}
+```
+
+The host then keeps the connection open. A command client sends this same
+ping/pong exchange again immediately before every Request; an attach client may
+send its attach action after the opening handshake, and `--check-host` simply
+closes its connection after confirming the opening pong. A successful socket
+connect without a valid pong is not accepted as proof of host health.
+
+### 2. Request (client → host)
+
+After the opening handshake and a fresh pre-command ping/pong, send a request
+line:
 
 ```json
 {"whoami":"Claude Code","dir":"/path/to/repo","envs":{"RUST_LOG":"debug"},"exec":["grep","-v","foo","bar.txt"],"timeout":30}
@@ -310,7 +398,10 @@ The first line is the request:
 | `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, fd 0 is `/dev/null`. |
 | `timeout` | integer (optional)   | Maximum runtime in seconds. Defaults to `0`, which disables the timeout. On expiry the host terminates the command's PTY process group. |
 
-### 2. Response (host → client)
+After its response is received, another request may be sent on the same
+connection. Requests on one connection are strictly sequential.
+
+### 3. Response (host → client)
 
 The host writes one line back when the command completes:
 
@@ -333,26 +424,6 @@ The host writes one line back when the command completes:
 | `aborted`      | The host killed the child because the client sent `abort` or disconnected. |
 | `timeout`      | The command exceeded its requested timeout; the response exit code is 124. |
 
-### 3. Ping / Pong (client ↔ host)
-
-Sent as the first (and only) message on a connection used purely to probe
-the host:
-
-```json
-{"action":"ping"}
-```
-
-The host replies:
-
-```json
-{"result":"pong"}
-```
-
-and closes the connection. `--check-host` uses this. A successful connect
-to the socket alone is also accepted as proof that the host is running, so
-new clients still report `HOST RUNNING` against older hosts that don't know
-the ping action.
-
 ### 4. Abort (client → host, optional)
 
 At any point after the request, the client may send:
@@ -361,17 +432,20 @@ At any point after the request, the client may send:
 {"action":"abort"}
 ```
 
-The reference client sends this automatically on any catchable termination
-(SIGINT, SIGTERM, SIGHUP, panic, or any drop of the connection before the
-response is read). On receipt the host signals the child's process group
-with SIGTERM, then SIGKILL after a 200 ms grace, and tags the transcript
-entry with `"error":"aborted"`. Clients that don't implement abort remain
-fully compatible — the host treats EOF on the connection identically.
+The one-shot CLI client sends this automatically on any catchable termination
+(SIGINT, SIGTERM, SIGHUP, panic, or a dropped request guard before the response
+is read). On receipt the host signals the child's process group with SIGTERM,
+then SIGKILL after a 200 ms grace, and tags the transcript entry with
+`"error":"aborted"`. Clients that do not send Abort are still safe: EOF while
+a command is active is treated as an abort. After a normal response, the
+connection remains available for another request.
 
 ### 5. Attach events (host → client)
 
-An attach client requests raw or filtered output with the `ansi` boolean. The
-host sends each entry completed after attachment as a JSONL event:
+After completing the ping/pong handshake, an attach client sends
+`{"action":"attach","ansi":true}`. The connection then becomes an attach-only
+event stream; it does not also carry command requests. The host sends each
+entry completed after attachment as a JSONL event:
 
 ```json
 {"event":"transcript","entry":{"whoami":"Codex","dir":"/tmp","envs":{},"exec":["printf","ok\\n"],"exit":0,"output":"ok\\n","time":"2026-05-21T09:42:24Z"}}
@@ -386,7 +460,7 @@ When the host shuts down it closes all attach streams.
 Per command, the host prints:
 
 ```
-[2026-05-21T09:42:18Z] Claude Code:/path/to/repo $ grep -v foo bar.txt
+[2026-05-21T09:42:18Z] Claude Code:/path/to/repo $ TO=0 grep -v foo bar.txt
 foobar
                                   <- trailing blank line separates commands
 ```
@@ -407,7 +481,9 @@ command, in arrival order:
 The file is opened with `O_CREAT | O_EXCL`; the host refuses to start if a
 transcript with the same name already exists. Entries are flushed after
 every append, so the transcript is durable up to the last completed
-command.
+command. The stored `timeout` field is omitted when it is zero for backward
+readability, but live console banners and `--print`/`--attach` rendering always
+show `TO=<seconds>`, including `TO=0` for unlimited commands.
 
 ## Security notes
 

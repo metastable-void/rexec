@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 use nix::libc;
 
@@ -15,45 +16,138 @@ use crate::protocol::{
 use crate::socket;
 use crate::transcript;
 
-/// Send a single request to the host and return the response. Used by the
-/// command-line `run` path and by the MCP server. Installs no signal handlers
-/// and does no I/O on stdout/stderr; the caller decides how to render results.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A ping-verified host socket that can execute multiple sequential requests.
+/// The MCP server pools these and reuses them until either side disconnects;
+/// one-shot CLI operations use the same handshake and framing.
+pub(crate) struct HostConnection {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl HostConnection {
+    pub(crate) fn connect(path: &Path) -> std::io::Result<Self> {
+        Self::connect_with_timeout(path, HANDSHAKE_TIMEOUT)
+    }
+
+    pub(crate) fn connect_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<Self> {
+        let stream = UnixStream::connect(path)?;
+        Self::from_stream_with_timeout(stream, timeout)
+    }
+
+    pub(crate) fn from_stream_with_timeout(
+        stream: UnixStream,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
+        let reader = BufReader::new(stream.try_clone()?);
+        let mut connection = Self { stream, reader };
+        connection.ping_with_timeout(timeout)?;
+        Ok(connection)
+    }
+
+    pub(crate) fn execute(&mut self, request: &Request) -> std::io::Result<Response> {
+        self.ping()?;
+        self.execute_after_ping(request)
+    }
+
+    pub(crate) fn ping(&mut self) -> std::io::Result<()> {
+        self.ping_with_timeout(HANDSHAKE_TIMEOUT)
+    }
+
+    pub(crate) fn execute_after_ping(&mut self, request: &Request) -> std::io::Result<Response> {
+        send_request(&self.stream, request)?;
+        read_response(&mut self.reader)
+    }
+
+    pub(crate) fn ping_with_timeout(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        let result = self.exchange_ping();
+        let clear_read = self.stream.set_read_timeout(None);
+        let clear_write = self.stream.set_write_timeout(None);
+        result?;
+        clear_read?;
+        clear_write
+    }
+
+    fn exchange_ping(&mut self) -> std::io::Result<()> {
+        let mut writer = &self.stream;
+        writer.write_all(PING_LINE)?;
+        writer.flush()?;
+
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "host disconnected before pong",
+            ));
+        }
+        match serde_json::from_str::<ControlResponse>(line.trim_end()) {
+            Ok(ControlResponse::Pong) => Ok(()),
+            Err(err) => Err(std::io::Error::other(format!("invalid host pong: {err}"))),
+        }
+    }
+
+    pub(crate) fn is_disconnected(&self) -> bool {
+        let mut byte = 0u8;
+        let result = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result == 0 {
+            return true;
+        }
+        if result > 0 {
+            return false;
+        }
+        !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code)
+                if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR
+        )
+    }
+
+    fn stream(&self) -> &UnixStream {
+        &self.stream
+    }
+
+    fn reader(&mut self) -> &mut BufReader<UnixStream> {
+        &mut self.reader
+    }
+}
+
+/// Send a single request to the host and return the response. Installs no
+/// signal handlers and does no I/O on stdout/stderr; the caller decides how to
+/// render results.
 pub fn exec_blocking(request: &Request) -> Result<Response, String> {
-    let stream =
-        UnixStream::connect(socket::socket_path()).map_err(|_| "HOST NOT FOUND".to_string())?;
-    send_request(&stream, request).map_err(|e| format!("send: {e}"))?;
-    read_response(&stream).map_err(|e| format!("read: {e}"))
+    let mut connection = HostConnection::connect(&socket::socket_path())
+        .map_err(|_| "HOST NOT FOUND".to_string())?;
+    connection
+        .execute(request)
+        .map_err(|e| format!("host: {e}"))
 }
 
 pub fn check_host() -> i32 {
-    let stream = match UnixStream::connect(socket::socket_path()) {
-        Ok(s) => s,
+    let _connection = match HostConnection::connect(&socket::socket_path()) {
+        Ok(connection) => connection,
         Err(_) => {
             println!("HOST NOT FOUND");
             return 127;
         }
     };
 
-    // Send the dedicated ping. A current host replies with `{"result":"pong"}`
-    // and closes; an older host will log it as a malformed request but still
-    // proves it's running by virtue of the successful connect.
-    let mut writer = &stream;
-    let _ = writer.write_all(PING_LINE);
-    let _ = writer.flush();
-
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    let _ = reader.read_line(&mut line);
-    let _ = serde_json::from_str::<ControlResponse>(line.trim_end());
-
     println!("HOST RUNNING");
     0
 }
 
 pub fn run(args: RunArgs) -> i32 {
-    let stream = match UnixStream::connect(socket::socket_path()) {
-        Ok(s) => s,
+    let mut connection = match HostConnection::connect(&socket::socket_path()) {
+        Ok(connection) => connection,
         Err(_) => {
             eprintln!("HOST NOT FOUND");
             return 127;
@@ -95,18 +189,11 @@ pub fn run(args: RunArgs) -> i32 {
     };
 
     install_abort_handlers();
-    let mut abort_guard = AbortGuard::arm(stream.as_raw_fd());
-
-    if let Err(err) = send_request(&stream, &request) {
-        eprintln!("rexec: failed to send request: {err}");
-        abort_guard.disarm();
-        return 127;
-    }
-
-    let response = match read_response(&stream) {
+    let mut abort_guard = AbortGuard::arm(connection.stream().as_raw_fd());
+    let response = match connection.execute(&request) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("rexec: failed to read response: {err}");
+            eprintln!("rexec: host request failed: {err}");
             abort_guard.disarm();
             return 127;
         }
@@ -214,8 +301,7 @@ fn send_request(mut stream: &UnixStream, request: &Request) -> std::io::Result<(
     Ok(())
 }
 
-fn read_response(stream: &UnixStream) -> std::io::Result<Response> {
-    let mut reader = BufReader::new(stream);
+fn read_response(reader: &mut BufReader<UnixStream>) -> std::io::Result<Response> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let resp: Response = serde_json::from_str(line.trim_end())
@@ -246,8 +332,8 @@ pub fn attach(color: ColorChoice) -> i32 {
         ColorChoice::Never => false,
         ColorChoice::Always => true,
     };
-    let stream = match UnixStream::connect(socket::socket_path()) {
-        Ok(stream) => stream,
+    let mut connection = match HostConnection::connect(&socket::socket_path()) {
+        Ok(connection) => connection,
         Err(_) => {
             eprintln!("HOST NOT FOUND");
             return 127;
@@ -261,7 +347,7 @@ pub fn attach(color: ColorChoice) -> i32 {
             return 127;
         }
     };
-    let mut writer = &stream;
+    let mut writer = connection.stream();
     if writer.write_all(body.as_bytes()).is_err()
         || writer.write_all(b"\n").is_err()
         || writer.flush().is_err()
@@ -270,11 +356,10 @@ pub fn attach(color: ColorChoice) -> i32 {
         return 127;
     }
 
-    let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        match connection.reader().read_line(&mut line) {
             Ok(0) => return 0,
             Ok(_) => {
                 let event = match serde_json::from_str::<HostEvent>(line.trim_end()) {
@@ -404,6 +489,8 @@ fn render_entry_to(
     } else {
         header.push_str(" $");
     }
+    header.push_str(" TO=");
+    header.push_str(&entry.timeout.to_string());
     for arg in &entry.exec {
         header.push(' ');
         header.push_str(&shell_quote(arg));
@@ -470,5 +557,23 @@ mod tests {
         let mut rendered = Vec::new();
         render_entry_to(&mut rendered, &entry("red\n"), false).unwrap();
         assert!(!rendered.contains(&0x1b));
+    }
+
+    #[test]
+    fn renderer_includes_requested_timeout_on_command_line() {
+        let mut timed = entry("red\n");
+        timed.timeout = 12;
+        let mut rendered = Vec::new();
+        render_entry_to(&mut rendered, &timed, false).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.starts_with("[2026-09-01T00:00:00Z] agent:/tmp $ TO=12 printf red\n"));
+    }
+
+    #[test]
+    fn renderer_includes_zero_for_unlimited_commands() {
+        let mut rendered = Vec::new();
+        render_entry_to(&mut rendered, &entry("red\n"), false).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.starts_with("[2026-09-01T00:00:00Z] agent:/tmp $ TO=0 printf red\n"));
     }
 }
