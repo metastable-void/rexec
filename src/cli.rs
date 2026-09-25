@@ -68,7 +68,7 @@ pub struct Cli {
     #[arg(short = 'm', long = "mcp-stdio", conflicts_with_all = ["check_host", "start_host", "list", "print", "attach", "install"])]
     pub mcp_stdio: bool,
 
-    /// Identifier of the calling agent (required when running a command).
+    /// Calling agent identity (required for commands); exposed as REXEC_WHOAMI.
     #[arg(long = "whoami")]
     pub whoami: Option<String>,
 
@@ -76,7 +76,7 @@ pub struct Cli {
     #[arg(long = "dir")]
     pub dir: Option<PathBuf>,
 
-    /// Environment overrides, in VAR=value form. Repeatable.
+    /// Environment overrides, in VAR=value form. REXEC_WHOAMI stays fixed.
     #[arg(
         short = 'e',
         long = "env",

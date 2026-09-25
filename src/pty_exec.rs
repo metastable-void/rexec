@@ -56,6 +56,7 @@ impl fmt::Display for SpawnError {
 impl std::error::Error for SpawnError {}
 
 pub fn spawn(
+    whoami: &str,
     argv: &[String],
     envs: &[(String, String)],
     clear_env: bool,
@@ -72,6 +73,7 @@ pub fn spawn(
         .map(|s| CString::new(s.as_str()).map_err(|_| SpawnError::NulByte("argument")))
         .collect::<Result<_, _>>()?;
     let argv_refs: Vec<&CString> = argv_c.iter().collect();
+    let whoami_c = CString::new(whoami).map_err(|_| SpawnError::NulByte("whoami"))?;
 
     let envs_c: Vec<(CString, CString)> = envs
         .iter()
@@ -146,6 +148,12 @@ pub fn spawn(
                         write_errno(write_raw, errno);
                         libc::_exit(127);
                     }
+                }
+                // Set this last so neither inheritance nor request overrides can replace it.
+                if libc::setenv(c"REXEC_WHOAMI".as_ptr(), whoami_c.as_ptr(), 1) != 0 {
+                    let errno = Errno::last() as i32;
+                    write_errno(write_raw, errno);
+                    libc::_exit(127);
                 }
                 let _ = execvp(&program, &argv_refs);
                 let errno = Errno::last() as i32;

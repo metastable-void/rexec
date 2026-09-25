@@ -33,6 +33,7 @@ const HOST_NOT_FOUND: &str = "HOST NOT FOUND";
     description = "Run a command via the rexec host (fresh PTY, ANSI-stripped output). \
         Returns a JSON object with `exit`, `output`, and optional `error` fields. \
         Pass environment overrides in `env` (use `{}` when none are needed); \
+        `REXEC_WHOAMI` is fixed to the server's `--whoami` value. \
         `clear_env` clears the inherited environment first. Provide `stdin` to \
         feed the child a UTF-8 buffer; set `timeout` to a maximum runtime in \
         seconds (zero disables it).",
@@ -49,7 +50,7 @@ pub struct ExecTool {
     /// Must be non-empty.
     pub argv: Vec<String>,
     /// Environment variable overrides. Pass an empty object when none are
-    /// needed. Names and values are forwarded without restriction.
+    /// needed. REXEC_WHOAMI is always set to the server's --whoami value.
     pub env: BTreeMap<String, String>,
     /// Clear the inherited environment before applying `env` overrides.
     #[serde(default)]

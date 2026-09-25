@@ -134,10 +134,10 @@ rexec --whoami Codex --dir /path/to/repo --env RUST_LOG=debug -- cargo test --wo
 
 | Flag           | Required | Description |
 |----------------|----------|-------------|
-| `--whoami`     | yes      | Identifier of the calling agent. Appears in the host banner and transcript. |
+| `--whoami`     | yes      | Identifier of the calling agent. Appears in the host banner, transcript, and child's `REXEC_WHOAMI` environment variable. |
 | `--dir`        | yes      | Working directory for the child. The host `chdir`s here. |
-| `-e`, `--env`  | no       | Unrestricted `VAR=VAL` overrides, repeatable. Applied after inheritance or `--clear-env`; later duplicates win. May override `PATH`. |
-| `--clear-env`  | no       | Remove the inherited environment before applying `--env`. With no `--env`, the child environment is empty. |
+| `-e`, `--env`  | no       | `VAR=VAL` overrides, repeatable. Applied after inheritance or `--clear-env`; later duplicates win. May override `PATH`, but cannot override `REXEC_WHOAMI`. |
+| `--clear-env`  | no       | Remove the inherited environment before applying `--env`. With no `--env`, the child environment contains only `REXEC_WHOAMI`. |
 | `--read-stdin` | no       | Read the client's stdin to EOF (must be valid UTF-8) and forward it to the child. The host attaches a pipe to the child's fd 0 and closes it after writing, so the child sees a real EOF. Without this flag fd 0 is `/dev/null`. |
 | `--timeout`    | no       | Kill the command's PTY process group after this many seconds. Defaults to `0`, which disables the timeout. |
 | `--`           | yes      | Separator; everything after is the command to execute. |
@@ -274,7 +274,7 @@ Two tools are exposed:
 
 | Tool         | Purpose |
 |--------------|---------|
-| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `env` (object of unrestricted environment overrides, required; pass `{}` when none are needed), `clear_env` (boolean, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). `clear_env: true` removes inherited variables before applying `env`, which may override `PATH`. Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
+| `exec`       | Run a command via the host. Arguments: `dir` (string, required), `argv` (array of strings, required), `env` (object of environment overrides, required; pass `{}` when none are needed), `clear_env` (boolean, optional), `stdin` (UTF-8 string, optional), and `timeout` (seconds, optional, defaults to `0`/disabled). `clear_env: true` removes inherited variables before applying `env`, which may override `PATH`. The child's `REXEC_WHOAMI` always equals the MCP server's `--whoami` value. Returns a JSON object with `exit`, `output`, and an optional `error` field; `isError` is set when the command exited non-zero or could not be found. |
 | `check_host` | Acquires a ping/pong-verified pooled connection, waiting up to 15 seconds if the host is unavailable. Returns `"HOST RUNNING"` or `"HOST NOT FOUND"`. |
 
 The MCP server itself does no work other than forwarding — a host started
@@ -402,7 +402,7 @@ line:
 |----------|-----------------------|-------------|
 | `whoami` | string                | Identifier of the calling agent. |
 | `dir`    | string                | Working directory; the host `chdir`s the child here. |
-| `envs`   | object<string,string> | Unrestricted environment overrides applied to the child. Omittable. |
+| `envs`   | object<string,string> | Environment overrides applied to the child. `REXEC_WHOAMI` is always set from `whoami`, even when `envs` supplies it. Omittable. |
 | `clear_env` | boolean (optional) | Clear the inherited environment before applying `envs`. Defaults to `false`. |
 | `exec`   | array<string>         | `argv[0]` is the program (resolved via `PATH`); rest are arguments. Must be non-empty. |
 | `stdin`  | string (optional)     | If present, the host attaches a pipe to the child's fd 0, writes these bytes (UTF-8), and closes the write end so the child sees EOF. If absent, fd 0 is `/dev/null`. |

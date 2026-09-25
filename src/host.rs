@@ -465,6 +465,7 @@ fn handle_connection(stream: UnixStream, host: Arc<HostState>) {
             .collect();
 
         let spawn_result = pty_exec::spawn(
+            &request.whoami,
             &request.exec,
             &envs_vec,
             request.clear_env,
@@ -1015,7 +1016,7 @@ mod tests {
         empty.clear_env = true;
         let response = connection.execute(&empty).unwrap();
         assert_eq!(response.exit, 0);
-        assert!(response.output.is_empty());
+        assert_eq!(response.output, "REXEC_WHOAMI=test\n");
 
         let mut overridden = test_request("/bin/sh");
         overridden.clear_env = true;
@@ -1023,17 +1024,47 @@ mod tests {
         overridden.exec = vec![
             "/bin/sh".into(),
             "-c".into(),
-            "printf '%s|%s' \"${HOME-unset}\" \"$PATH\"".into(),
+            "printf '%s|%s|%s' \"${HOME-unset}\" \"$PATH\" \"$REXEC_WHOAMI\"".into(),
         ];
         let response = connection.execute(&overridden).unwrap();
         assert_eq!(response.exit, 0);
-        assert_eq!(response.output, "unset|/custom/bin");
+        assert_eq!(response.output, "unset|/custom/bin|test");
 
         drop(connection);
         host.join().unwrap();
         let entries = crate::transcript::read_entries(&transcript_path).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.clear_env));
+        let _ = std::fs::remove_file(transcript_path);
+    }
+
+    #[test]
+    fn whoami_env_cannot_be_overridden_by_request() {
+        let (host_end, client_end) = UnixStream::pair().unwrap();
+        let (state, transcript_path) = test_host_state();
+        let host = std::thread::spawn(move || handle_connection(host_end, state));
+        let mut connection =
+            client::HostConnection::from_stream_with_timeout(client_end, Duration::from_secs(1))
+                .unwrap();
+
+        for clear_env in [false, true] {
+            let mut request = test_request("/usr/bin/env");
+            request.whoami = "Claude Code".into();
+            request.clear_env = clear_env;
+            request.envs.insert("REXEC_WHOAMI".into(), "spoofed".into());
+            let response = connection.execute(&request).unwrap();
+            assert_eq!(response.exit, 0);
+            assert!(
+                response
+                    .output
+                    .lines()
+                    .any(|line| line == "REXEC_WHOAMI=Claude Code")
+            );
+            assert!(!response.output.contains("REXEC_WHOAMI=spoofed"));
+        }
+
+        drop(connection);
+        host.join().unwrap();
         let _ = std::fs::remove_file(transcript_path);
     }
 
