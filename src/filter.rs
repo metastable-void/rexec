@@ -78,10 +78,7 @@ mod tests {
 
     #[test]
     fn strips_sgr_color_sequence() {
-        assert_eq!(
-            filter_all(b"\x1b[31mred\x1b[0m text"),
-            b"red text"
-        );
+        assert_eq!(filter_all(b"\x1b[31mred\x1b[0m text"), b"red text");
     }
 
     #[test]
