@@ -17,7 +17,7 @@ use rust_mcp_sdk::schema::schema_utils::CallToolError;
 use rust_mcp_sdk::schema::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, RpcError, ServerCapabilities, ServerCapabilitiesTools,
-    TextContent,
+    TextContent, Tool,
 };
 use rust_mcp_sdk::{McpServer, StdioTransport, ToMcpServerHandler, TransportOptions, tool_box};
 
@@ -77,6 +77,28 @@ pub struct ExecTool {
 pub struct CheckHostTool {}
 
 tool_box!(RexecTools, [ExecTool, CheckHostTool]);
+
+fn advertised_tools() -> Vec<Tool> {
+    let mut tools = RexecTools::tools();
+    // rust-mcp-macros 0.9 emits {"type":"unknown"} for BTreeMap fields.
+    // Correct the advertised schema while keeping the object-shaped argument.
+    let exec = tools
+        .iter_mut()
+        .find(|tool| tool.name == ExecTool::tool_name())
+        .expect("exec tool is registered");
+    let env = exec
+        .input_schema
+        .properties
+        .as_mut()
+        .and_then(|properties| properties.get_mut("env"))
+        .expect("exec env property exists");
+    env.insert("type".into(), serde_json::json!("object"));
+    env.insert(
+        "additionalProperties".into(),
+        serde_json::json!({ "type": "string" }),
+    );
+    tools
+}
 
 #[derive(Clone)]
 struct Handler {
@@ -395,7 +417,7 @@ impl ServerHandler for Handler {
         Ok(ListToolsResult {
             meta: None,
             next_cursor: None,
-            tools: RexecTools::tools(),
+            tools: advertised_tools(),
         })
     }
 
@@ -641,11 +663,13 @@ mod tests {
 
     #[test]
     fn exec_schema_exposes_environment_controls_and_timeout() {
-        let tools = serde_json::to_value(RexecTools::tools()).unwrap();
-        let tools = tools.to_string();
-        assert!(tools.contains("\"env\""));
-        assert!(tools.contains("\"clear_env\""));
-        assert!(tools.contains("\"timeout\""));
+        let tools = serde_json::to_value(advertised_tools()).unwrap();
+        let schema = &tools[0]["inputSchema"];
+        let env = &schema["properties"]["env"];
+        assert_eq!(env["type"], "object", "env schema: {env}");
+        assert_eq!(env["additionalProperties"]["type"], "string");
+        assert!(schema["properties"]["clear_env"].is_object());
+        assert!(schema["properties"]["timeout"].is_object());
     }
 
     #[test]
